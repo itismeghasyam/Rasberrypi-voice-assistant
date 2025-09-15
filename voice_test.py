@@ -3,7 +3,7 @@ import wave
 import subprocess
 import requests
 import json
-
+import pyttsx3
 
 
 
@@ -19,12 +19,12 @@ OLLAMA_MODEL = "mistral"
 
 def record_wav(path = RECORDED_WAV, duration = DURATION, s_r = SAMPLE_RATE):
     print(f"Recording audio for {duration} seconds at {s_r} Hz")
-    audio = sd.rec(int(duration * s_r), samplerate=s_r, channels=1)
+    audio = sd.rec(int(duration * s_r), samplerate=s_r, channels=1, dtype='int16')
     sd.wait()
     audio = audio.flatten().astype('int16')
     with wave.open(path, 'wb') as wf: 
         wf.setnchannels(1)
-        wf.setsamplewidth(2)
+        wf.setsampwidth(2)
         
         wf.setframerate(s_r)
         wf.writeframes(audio.tobytes())
@@ -33,7 +33,7 @@ def record_wav(path = RECORDED_WAV, duration = DURATION, s_r = SAMPLE_RATE):
 
 def transcribe_audio(wav_path):
     cmd = [WHISPER_EXE_PATH, "-m", WHISPER_MODEL, "-f", wav_path]
-    print("Running the command : " .join(cmd))
+    print("Running the command : ","" .join(cmd))
     try:
         proces = subprocess.run(cmd,capture_output = True, text = True, timeout = 120 )
     except subprocess.TimeoutExpired:
@@ -41,12 +41,12 @@ def transcribe_audio(wav_path):
         return ""
     raw = proces.stdout.strip() or proces.stderr.strip()
     
-    lines = [l.strip() for l in raw.split() if l.strip()]
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
     if not lines:
         return "Nothing transcribed"
     
     for line in reversed(lines):
-        if line.startswith('[]') and '-->' in line:
+        if line.startswith('[') and '-->' in line:
             continue
         if ']' in line: 
             text = line.split(']')[-1].strip()
@@ -73,7 +73,7 @@ def generate_response(prompt, timeout=30):
         if "text" in data and isinstance(data["text"], str):
             return data["text"].strip()
         
-        if "completion"  in data and isinstance(data["completition"], str):
+        if "completion"  in data and isinstance(data["completion"], str):
             return data["completition"].strip()
         
         if "choices" in data and isinstance(data["choices"], list) and len(data["choices"])>0:
@@ -81,8 +81,15 @@ def generate_response(prompt, timeout=30):
             if isinstance(c, dict) and "text" in c:
                 return c["text"].strip()   
     return json.dumps(data)[:1000]
-def speak_text():
-    print("hello")
+
+
+def speak_text(text):
+    print(f"Speak: {text}")
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)
+    engine.say(text)
+    engine.runAndWait()
+    
 
 def main():
     record_wav()
