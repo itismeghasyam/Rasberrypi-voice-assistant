@@ -70,9 +70,9 @@ def generate_response(prompt, timeout=30):
         print(f"Ollama error: {e}")
         return "Sorry, couldn't send request to the model"
     if isinstance(data,dict):
-        if "text" in data and isinstance(data["text"], str):
-            return data["text"].strip()
-        
+        if "response" in data and isinstance(data["response"], str):
+            return data["response"].strip()
+
         if "completion"  in data and isinstance(data["completion"], str):
             return data["completition"].strip()
         
