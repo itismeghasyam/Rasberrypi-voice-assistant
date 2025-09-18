@@ -128,7 +128,7 @@ def transcribe_audio(wav_path):
 
     return ""
 
-def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
+def generate_response_local_llama(prompt_text, n_predict=16, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
 
