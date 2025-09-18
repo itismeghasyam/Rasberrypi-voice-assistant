@@ -74,7 +74,7 @@ def transcribe_audio(wav_path):
     cmd = [str(exe), "-m", str(model), "-f", str(wav_path), "--no-prints", "--output-txt"]
     print("[STT] Running:", " ".join(shlex.quote(c) for c in cmd))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=800)
     except subprocess.TimeoutExpired:
         print("[STT] Transcription timed out")
         return ""
@@ -155,7 +155,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     print("[LLM] Running local llama:", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=800 + n_predict * 3)
     except subprocess.TimeoutExpired:
         print("[LLM] Local llama generation timed out")
         return None, None, None
