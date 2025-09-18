@@ -149,7 +149,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         "-n", str(n_predict),
         "-t", str(threads),
         "--temp", str(temperature),
-        "--top-p", "0.2",
+        "--top-p", "0.8",
         "--top-k", "40",
     ]
 
