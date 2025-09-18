@@ -149,8 +149,6 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         "-n", str(n_predict),
         "-t", str(threads),
         "--temp", str(temperature),
-        "--top-p", "0.8",
-        "--top-k", "40",
     ]
 
    
@@ -218,16 +216,8 @@ def generate_response_ollama(user_text, timeout=30):
     return json.dumps(data)[:1000]
 
 def main():
-    wav = record_wav()
-    transcribed = transcribe_audio(wav)
+    
     text = "What is one plus one"
-    if not transcribed:
-        print("[MAIN] No transcription found.")
-        speak_text("Sorry, I did not hear anything.")
-        return
-
-    print("[MAIN] Final transcription to send to model:", repr(transcribed))
-
     # Try local llama first
     generated, elapsed, tokens = generate_response_local_llama(text, n_predict=128, threads=4, temperature=0.8)
     if generated is None:
