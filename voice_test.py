@@ -1,36 +1,43 @@
-#!/usr/bin/env python3
-import os, shlex, subprocess, json, time
+
+import os
+import shlex
+import subprocess
+import json
+import time
 from pathlib import Path
 
 import sounddevice as sd
 import wave
 import requests
+from pathlib import Path
+import shlex, subprocess, re
 
-PROJECT_DIR = Path.cwd()   # use current working dir
+PROJECT_DIR = Path.cwd()   
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
+DURATION = 6
+
+# whisper 
 WHISPER_EXE_PATH = str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli")
 WHISPER_MODEL = str(Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin")
-OLLAMA_URL = "http://192.168.0.102:11434/api/generate"  # change if needed
+
+# Local LLM
+LLAMA_CLI = str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
+LOCAL_MODEL = str(Path.home() / "models" / "gpt2.Q4_K_M.gguf")
+
+# Ollama 
+OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
 OLLAMA_MODEL = "mistral"
-DURATION = 6
+
+
 _tts_engine = None
-def get_tts_engine():
-    global _tts_engine
-    if _tts_engine is None:
-        try:
-            import pyttsx3
-            _tts_engine = pyttsx3.init()
-            _tts_engine.setProperty('rate', 150)
-        except Exception:
-            _tts_engine = None
-    return _tts_engine
 
 def speak_text(text: str):
     text = (text or "").strip()
     if not text:
         return
     print("[TTS] Speak:", text)
+    # Direct espeak call (robust for Pi + bluetooth)
     try:
         subprocess.run(["espeak", text], check=True)
     except Exception as e:
@@ -51,19 +58,7 @@ def record_wav(path=RECORDED_WAV, duration=DURATION, s_r=SAMPLE_RATE):
     print(f"[REC] Saved: {path}")
     return str(path)
 
-
-import tempfile
-from pathlib import Path
-
 def transcribe_audio(wav_path):
-    """
-    Run whisper.cpp on wav_path and return the transcription text.
-    Tries to use --no-prints + --output-txt and handles both
-    possible output filenames: recorded.txt and recorded.wav.txt.
-    Falls back to heuristic parsing if needed.
-    """
-    from pathlib import Path
-    import shlex, subprocess, re
 
     wav_path = Path(wav_path)
     exe = Path(WHISPER_EXE_PATH)
@@ -84,6 +79,7 @@ def transcribe_audio(wav_path):
         print("[STT] Transcription timed out")
         return ""
 
+    # whisper.cpp may write either "recorded.txt" or "recorded.wav.txt"
     cand1 = wav_path.with_suffix(".txt")           # recorded.txt
     cand2 = Path(str(wav_path) + ".txt")           # recorded.wav.txt
     for p in (cand1, cand2):
@@ -109,7 +105,7 @@ def transcribe_audio(wav_path):
         low = line.lower()
         if "-->" in line and "[" in line:
             continue
-        if low.startswith("whisper_") or low.startswith("whisper") and "transcrib" not in low:
+        if low.startswith("whisper_") or (low.startswith("whisper") and "transcrib" not in low):
             continue
         if "output_txt" in low or "saving output" in low or "total time" in low or "load time" in low:
             continue
@@ -132,13 +128,68 @@ def transcribe_audio(wav_path):
 
     return ""
 
+def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.7):
+    exe = Path(LLAMA_CLI)
+    model = Path(LOCAL_MODEL)
+
+    if not exe.exists() or not model.exists():
+        missing = []
+        if not exe.exists():
+            missing.append("llama-cli")
+        if not model.exists():
+            missing.append("local model")
+        print("[LLM] Local llama not available (missing {}). Falling back to Ollama.".format(", ".join(missing)))
+        return None, None, None
+
+    prompt_escaped = prompt_text
+    cmd = [
+        str(exe),
+        "-m", str(model),
+        "-p", prompt_escaped,
+        "-n", str(n_predict),
+        "-t", str(threads),
+        "-temp", str(temperature),  # some builds use -temp or --temp; if this errors try removing
+    ]
+
+   
+    print("[LLM] Running local llama:", " ".join(shlex.quote(c) for c in cmd))
+    start = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+    except subprocess.TimeoutExpired:
+        print("[LLM] Local llama generation timed out")
+        return None, None, None
+    elapsed = time.time() - start
+
+    out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not out:
+        return "", elapsed, 0
+
+    
+    generated = out
+    if prompt_text.strip() and prompt_text.strip() in out:
+        # split by the prompt and take the remainder
+        parts = out.split(prompt_text.strip())
+        if len(parts) > 1:
+            generated = parts[-1].strip()
+
+    
+    lines = [l for l in generated.splitlines() if l.strip()]
+    if lines:
+        generated = "\n".join(lines).strip()
+
+    # approximate tokens by whitespace-splitting (rough)
+    tokens = len(generated.split())
+    tps = tokens / elapsed if elapsed > 0 else 0.0
+
+    print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
+    return generated, elapsed, tokens
 
 def generate_response_ollama(user_text, timeout=30):
-    # strong system message to prevent persona hallucination
+    # fallback method if local llama isn't available
     system_prefix = (
         "SYSTEM: You are a concise, factual assistant. "
         "Do NOT invent personal biography, names, ages, or experiences. "
-        "If asked about yourself, reply: 'I am an AI assistant running on a server.' "
         "Answer in 1-2 short sentences.\n\n"
     )
     prompt = f"{system_prefix}User: {user_text}\nAssistant:"
@@ -147,7 +198,7 @@ def generate_response_ollama(user_text, timeout=30):
         "prompt": prompt,
         "temperature": 0.2,
         "top_p": 0.7,
-        "max_tokens": 48,
+        "max_tokens": 64,
         "stream": False
     }
     headers = {"Content-Type": "application/json"}
@@ -157,27 +208,36 @@ def generate_response_ollama(user_text, timeout=30):
         data = r.json()
     except Exception as e:
         print("[LLM] Ollama error:", e)
-        return "Sorry, I couldn't reach the model."
+        return "Sorry, I couldn't reach the model"
     if isinstance(data, dict):
-        for key in ("response","text","completion"):
+        for key in ("response", "text", "completion"):
             if key in data and isinstance(data[key], str):
                 return data[key].strip()
     return json.dumps(data)[:1000]
 
 def main():
     wav = record_wav()
-    # quick playback check - comment out if not needed
-    # subprocess.run(["aplay", wav])
-    trans = transcribe_audio(wav)
-    if not trans:
-        print("[MAIN] Nothing transcribed.")
+    transcribed = transcribe_audio(wav)
+    if not transcribed:
+        print("[MAIN] No transcription found.")
         speak_text("Sorry, I did not hear anything.")
         return
-    # print exact transcription for debugging
-    print("[MAIN] Final transcription to send to model:", repr(trans))
-    resp = generate_response_ollama(trans)
-    print("[MAIN] Model replied:", resp)
-    speak_text(resp)
+
+    print("[MAIN] Final transcription to send to model:", repr(transcribed))
+
+    # Try local llama first
+    generated, elapsed, tokens = generate_response_local_llama(transcribed, n_predict=128, threads=4, temperature=0.6)
+    if generated is None:
+        # fallback to Ollama cloud/other host
+        print("error with generating response")
+        return
+
+    
+    print("[MAIN] Model replied (local):", generated)
+    if elapsed is not None:
+        approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
+        print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
+    speak_text(generated)
 
 if __name__ == "__main__":
     main()
