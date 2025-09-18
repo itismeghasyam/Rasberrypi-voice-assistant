@@ -226,7 +226,7 @@ def main():
     print("[MAIN] Final transcription to send to model:", repr(transcribed))
 
     # Try local llama first
-    generated, elapsed, tokens = generate_response_local_llama(transcribed, n_predict=128, threads=4, temperature=0.1)
+    generated, elapsed, tokens = generate_response_local_llama(transcribed, n_predict=128, threads=4, temperature=0.3)
     if generated is None:
         # fallback to Ollama cloud/other host
         print("error with generating response")
