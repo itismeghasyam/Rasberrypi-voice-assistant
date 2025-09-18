@@ -148,7 +148,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         "-p", prompt_escaped,
         "-n", str(n_predict),
         "-t", str(threads),
-        "-temp", str(temperature),  # some builds use -temp or --temp; if this errors try removing
+        "--temp", str(temperature),  # some builds use -temp or --temp; if this errors try removing
     ]
 
    
