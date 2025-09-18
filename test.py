@@ -220,6 +220,7 @@ def generate_response_ollama(user_text, timeout=30):
 def main():
     wav = record_wav()
     transcribed = transcribe_audio(wav)
+    text = "What is one plus one"
     if not transcribed:
         print("[MAIN] No transcription found.")
         speak_text("Sorry, I did not hear anything.")
@@ -228,7 +229,7 @@ def main():
     print("[MAIN] Final transcription to send to model:", repr(transcribed))
 
     # Try local llama first
-    generated, elapsed, tokens = generate_response_local_llama(transcribed, n_predict=128, threads=4, temperature=0.8)
+    generated, elapsed, tokens = generate_response_local_llama(text, n_predict=128, threads=4, temperature=0.8)
     if generated is None:
         # fallback to Ollama cloud/other host
         print("error with generating response")
