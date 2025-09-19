@@ -385,149 +385,57 @@ def llama110(prompt_text: str,
     return result
 
 
-def qwen25(prompt_text: str,
-           llama_cli_path: str = None,
-           model_path: str = None,
-           n_predict: int = 16,
-           threads: int = 4,
-           temperature: float = 0.1,
-           sampler: ResourceSampler = None,
-           instruct_prefix: str = "Answer in one short sentence.",
-           tts_after: bool = False,
-           tts_cmd = None,
-           timeout_seconds: int = 180):
-    
-    # sensible defaults
-    if llama_cli_path is None:
-        llama_cli_path = LLAMA_CLI if 'LLAMA_CLI' in globals() else str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
+
+
+def run_qwen_once(prompt: str,
+                  llama_cli: str = None,
+                  model_path: str = None,
+                  n_predict: int = 32,
+                  threads: int = 2,
+                  temp: float = 0.0,
+                  timeout: int = 600):
+    """
+    Run the Qwen gguf non-interactively and return dict:
+      { stdout, stderr, elapsed, timed_out, rc }
+    """
+    if llama_cli is None:
+        llama_cli = str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
     if model_path is None:
         model_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
 
-    exe = Path(llama_cli_path)
-    model = Path(model_path)
-
-    result = {
-        "generated": "",
-        "model_reply_time": 0.0,
-        "model_inference_time": None,
-        "tokens": 0,
-        "tts_time": 0.0,
-        "resource": {"peak_rss":0, "avg_rss":0, "peak_cpu":0.0, "avg_cpu":0.0, "samples":0},
-        "raw_stdout": "",
-        "raw_stderr": ""
-    }
-
-    if sampler is None:
-        sampler = ResourceSampler(interval=0.05)
-
-    if not exe.exists():
-        raise FileNotFoundError(f"llama-cli binary not found at: {exe}")
-    if not model.exists():
-        raise FileNotFoundError(f"qwen model not found at: {model}")
-
-    # build final prompt (prepend prefix if requested)
-    if instruct_prefix:
-        full_prompt = f"{instruct_prefix} {prompt_text.strip()}"
-    else:
-        full_prompt = prompt_text
-
-    # command — adjust flags if your llama-cli uses different flag names
     cmd = [
-        str(exe),
-        "-m", str(model),
-        "-p", full_prompt,
+        str(Path(llama_cli)),
+        "-m", str(Path(model_path)),
+        "-p", prompt,
         "-n", str(n_predict),
         "-t", str(threads),
-        "--temp", str(temperature),
+        "--temp", str(temp),
+
+        # IMPORTANT: prevent interactive chat + suppress logs
+        "-no-cnv",         # disable conversation mode
+        "--single-turn",   # exit after the single response
+        "--log-disable",   # try to hide loader logging
+        "--no-warmup",     # optional: skip warmup prints
     ]
 
-    # run with resource sampling
-    sampler.start()
-    t0 = time.time()
+    start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
-        t1 = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        elapsed = time.time() - start
+        timed_out = False
     except subprocess.TimeoutExpired as e:
-        t1 = time.time()
-        sampler.stop()
-        result.update({
-            "raw_stdout": getattr(e, "stdout", "") or "",
-            "raw_stderr": getattr(e, "stderr", "") or "TIMEOUT",
-            "model_reply_time": t1 - t0
-        })
-        return result
+        elapsed = time.time() - start
+        stdout = (e.stdout or "") if hasattr(e, "stdout") else ""
+        stderr = (e.stderr or "TIMEOUT") if hasattr(e, "stderr") else "TIMEOUT"
+        return {"stdout": stdout, "stderr": stderr, "elapsed": elapsed, "timed_out": True, "rc": None}
 
-    sampler.stop()
-
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    result["raw_stdout"] = stdout
-    result["raw_stderr"] = stderr
-
-    result["model_reply_time"] = t1 - t0
-
-    # isolate generation: remove the prompt echo if present
-    generated = stdout
-    if full_prompt.strip() and full_prompt.strip() in generated:
-        parts = generated.split(full_prompt.strip())
-        if len(parts) > 1:
-            generated = parts[-1].strip()
-
-    # if stdout empty, fallback to stderr
-    if not generated and stderr:
-        generated = stderr.strip()
-
-    # last-ditch: filter diagnostic lines from combined output and take last useful line
-    if not generated:
-        combined = (stdout + "\n" + stderr).strip()
-        lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
-        filtered = [ln for ln in lines if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace", "init"))]
-        if filtered:
-            generated = filtered[-1]
-
-    result["generated"] = (generated or "").strip()
-    result["tokens"] = len(result["generated"].split())
-
-    # Best-effort parse of any "inference time" or "total time" numbers in the raw output
-    inference_time = None
-    raw_combined = (stdout + "\n" + stderr).strip()
-    patterns = [
-        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
-        r"([0-9]*\.?[0-9]+)\s*ms\b",
-        r"([0-9]*\.?[0-9]+)\s*s\b",
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, raw_combined, flags=re.IGNORECASE):
-            num = m.group(1)
-            unit = m.group(2) if m.lastindex and m.lastindex >= 2 else None
-            try:
-                v = float(num)
-                if unit and unit.lower().startswith("ms"):
-                    v = v / 1000.0
-                if v > 0:
-                    inference_time = v
-                    break
-            except Exception:
-                continue
-        if inference_time is not None:
-            break
-    result["model_inference_time"] = inference_time
-
-    # resource summary
-    result["resource"] = sampler.summary()
-
-    # optional TTS (measured)
-    if tts_after and result["generated"]:
-        try:
-            tts_elapsed = speak_text_timed(result["generated"])  # will swallow exceptions
-        except Exception:
-            tts_elapsed = speak_text_timed(result["generated"]) if 'speak_text_timed' in globals() else 0.0
-        result["tts_time"] = tts_elapsed
-
-    return result
+    return {
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
+        "elapsed": elapsed,
+        "timed_out": False,
+        "rc": proc.returncode
+    }
 
 
 
@@ -675,18 +583,8 @@ def main():
 """
 
     qwen_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+    res = run_qwen_once(prompt_to_model, llama_cli=LLAMA_CLI, model_path=qwen_path, n_predict=16, threads=2, temp=0.1, timeout=600)
 
-    res = qwen25(
-        prompt_text=transcribed,
-        llama_cli_path=LLAMA_CLI,    
-        model_path=qwen_path,
-        n_predict=16,
-        threads=4,
-        temperature=0.2,         
-        sampler=sampler,
-        instruct_prefix="Answer in one short sentence.",  
-        tts_after=False,
-        timeout_seconds=250)
 
         
         
