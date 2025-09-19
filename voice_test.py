@@ -36,7 +36,7 @@ QWEN_MODEL_LARGE = str(Path.home() / "Downloads" / "qwen2.5-1.5b-instruct-q3_k_m
 QWEN_MODEL = QWEN_MODEL_SMALL
 # SmallThinker (local, via llama.cpp)
 SMALLTHINKER_MODEL = str(Path.home() / "Downloads" / "SmallThinker-3B-Preview.Q3_K_M.gguf")
-SMALLTHINKER_MODEL_4B = str(Path.home()/ "Downloads" / "SmallThinker-4B-A0.6B-Instruct.Q3_K_S.gguf" )
+SMALLTHINKER_MODEL_4B = str(Path.home() / "Downloads" / "SmallThinker-4B-A0.6B-Instruct.Q3_K_S.gguf")
 # SmolLM (local, via llama.cpp)
 SMOLLM_MODEL = str(Path.home() / "Downloads" / "smollm-135m-instruct-add-basics-q8_0.gguf")
 # Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
@@ -221,6 +221,48 @@ class ResourceSampler:
         }
 
 
+def _empty_resource_summary():
+    """Return a fresh zeroed resource summary mapping."""
+    return {
+        "peak_rss": 0,
+        "avg_rss": 0,
+        "peak_cpu": 0.0,
+        "avg_cpu": 0.0,
+        "samples": 0,
+    }
+
+
+def _parse_llama_timing(raw_text):
+    """Best-effort extraction of an inference time from llama.cpp output."""
+    if not raw_text:
+        return None
+
+    patterns = [
+        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"model(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
+        r"([0-9]*\.?[0-9]+)\s*ms\b",
+        r"([0-9]*\.?[0-9]+)\s*s\b",
+    ]
+
+    for pat in patterns:
+        for match in re.finditer(pat, raw_text, flags=re.IGNORECASE):
+            num = match.group(1)
+            unit = match.group(2) if match.lastindex and match.lastindex >= 2 else None
+            try:
+                val = float(num)
+                if unit and unit.lower().startswith("ms"):
+                    val = val / 1000.0
+                if val > 0:
+                    return val
+            except Exception:
+                continue
+
+    return None
+
+
 # small TTS wrapper
 
 def speak_text_timed(text: str, cmd=None):
@@ -354,34 +396,7 @@ def llama110(prompt_text: str,
 
     # Attempt to parse model-reported inference timings, e.g. lines like "inference time: 123.45 ms"
     # This is best-effort: look for numbers followed by 'ms' or 's' near keywords.
-    inference_time = None
-    # common patterns: "inference time: 123.4 ms", "total time: 1.23s", "real time: 0.123s"
-    patterns = [
-        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"model(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
-        r"([0-9]*\.?[0-9]+)\s*ms\b",
-        r"([0-9]*\.?[0-9]+)\s*s\b",
-    ]
-    for pat in patterns:
-        for match in re.finditer(pat, raw_combined, flags=re.IGNORECASE):
-            num = match.group(1)
-            unit = match.group(2) if match.lastindex and match.lastindex >= 2 else None
-            try:
-                val = float(num)
-                if unit and unit.lower().startswith("ms"):
-                    val = val / 1000.0
-                # prefer a small positive non-zero inference_time
-                if val > 0:
-                    inference_time = val
-                    break
-            except Exception:
-                continue
-        if inference_time is not None:
-            break
-
+    inference_time = _parse_llama_timing(raw_combined)
     # If we didn't find a specific model-reported time, keep None (so caller can differentiate)
     result["model_inference_time"] = inference_time
 
@@ -476,19 +491,20 @@ def _run_qwen_llama_cpp(
 ):
     """
     Shared helper to invoke llama.cpp with a given Qwen model and common hygiene.
-    Returns (generated_text, elapsed_seconds, token_estimate) just like the
-    legacy wrappers.
+    Returns (generated_text, elapsed_seconds, token_estimate, resource_summary,
+    parsed_inference_time) just like the legacy wrappers but with additional
+    runtime metrics.
     """
     exe = Path(LLAMA_CLI)
     model = Path(model_path)
 
     if not exe.exists():
         print(f"[LLM] llama-cli binary not found: {exe}")
-        return None, None, None
+        return None, None, None, _empty_resource_summary(), None
 
     if not model.exists():
         print(f"[LLM] {label} model not found: {model}")
-        return None, None, None
+        return None, None, None, _empty_resource_summary(), None
 
     cmd = [
         str(exe),
@@ -506,6 +522,9 @@ def _run_qwen_llama_cpp(
 
     print(f"[LLM] Running {label} (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
+    sampler = ResourceSampler(interval=0.05)
+    sampler.start()
+    timeout_seconds = 120 + n_predict * timeout_scale
     try:
         # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
         # exits once generation is finished instead of waiting for extra input.
@@ -514,18 +533,28 @@ def _run_qwen_llama_cpp(
             capture_output=True,
             text=True,
 
-            timeout=120 + n_predict * timeout_scale,
+            timeout=timeout_seconds,
 
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         print(f"[LLM] {label} generation timed out")
-        return None, None, None
+        sampler.stop()
+        elapsed = time.time() - start
+        resource_summary = sampler.summary()
+        return None, elapsed, 0, resource_summary, None
+    except Exception:
+        sampler.stop()
+        raise
+    else:
+        sampler.stop()
 
     elapsed = time.time() - start
+    resource_summary = sampler.summary()
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0
+        inference_time = _parse_llama_timing((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else ""))
+        return "", elapsed, 0, resource_summary, inference_time
 
     # Strip echoed prompt if present
     generated = out
@@ -542,7 +571,9 @@ def _run_qwen_llama_cpp(
     tokens = len(generated.split())
     tps = tokens / elapsed if elapsed > 0 else 0.0
     print(f"[LLM] {label} generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-    return generated, elapsed, tokens
+    raw_combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    inference_time = _parse_llama_timing(raw_combined)
+    return generated, elapsed, tokens, resource_summary, inference_time
 
 
 def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
@@ -605,8 +636,8 @@ def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperatu
         label="SmallThinker 3B",
     )
 
-def generate_response_smallthinker_4B(user_text, n_predict=64, threads=4, temperature=0.2):
-    """Run SmallThinker 4B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
+def generate_response_smallthinker_4b(user_text, n_predict=64, threads=4, temperature=0.2):
+    """Run SmallThinker 4B (quant: Q3_K_S) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
         SMALLTHINKER_MODEL_4B,
         user_text,
@@ -616,9 +647,9 @@ def generate_response_smallthinker_4B(user_text, n_predict=64, threads=4, temper
         extra_cli=[
             "--simple-io",
             "-ngl", "0",
-            "--ctx-size", "1024",
+            "--ctx-size", "1536",
         ],
-        timeout_scale=20,
+        timeout_scale=24,
         label="SmallThinker 4B",
     )
 
@@ -657,13 +688,22 @@ def select_qwen_generator(preference=None):
     small_exists = Path(QWEN_MODEL).exists()
 
     thinker_exists = Path(SMALLTHINKER_MODEL).exists()
-    thinker_4B_exists = Path(SMALLTHINKER_MODEL_4B).exists()
+    thinker_4b_exists = Path(SMALLTHINKER_MODEL_4B).exists()
 
 
     large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
     small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
     thinker_alias = {"smallthinker", "thinker", "3b", "3_b", "smallthinker-3b"}
-    thinker_4B_alias = {"smallthinker_4B", "thinker_4b", "4b", "4_b", "smallthinker-4b"}
+    thinker_4b_alias = {
+        "smallthinker4b",
+        "smallthinker-4b",
+        "smallthinker_4b",
+        "thinker4b",
+        "thinker-4b",
+        "thinker_4b",
+        "4b",
+        "4_b",
+    }
 
 
 
@@ -672,10 +712,10 @@ def select_qwen_generator(preference=None):
             return generate_response_smallthinker, "SmallThinker 3B"
         print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL}. Falling back to Qwen options.")
         pref = "fallback-small"
-        
-    if pref in thinker_4B_alias:
-        if thinker_4B_exists:
-            return generate_response_smallthinker, "SmallThinker 4B"
+
+    if pref in thinker_4b_alias:
+        if thinker_4b_exists:
+            return generate_response_smallthinker_4b, "SmallThinker 4B"
         print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL_4B}. Falling back to Qwen options.")
         pref = "fallback-small"
 
@@ -701,18 +741,18 @@ def select_qwen_generator(preference=None):
         if small_exists:
             return generate_response_qwen, "Qwen 0.5B"
 
+        if thinker_4b_exists:
+            return generate_response_smallthinker_4b, "SmallThinker 4B"
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
-        if thinker_4B_exists:
-            return generate_response_smallthinker_4B, "SmallThinker 4B"
-        
 
-    known_aliases = large_alias | small_alias | thinker_alias | {"auto", "fallback-small"}
+
+    known_aliases = large_alias | small_alias | thinker_alias | thinker_4b_alias | {"auto", "fallback-small"}
 
     if pref not in known_aliases and pref:
         print(
             f"[MAIN] Unknown variant '{pref_raw}'. Valid options: 0.5B/small, 1.5B/large, "
-            "SmallThinker, auto."
+            "SmallThinker (3B/4B), auto."
         )
 
 
@@ -721,11 +761,11 @@ def select_qwen_generator(preference=None):
     if large_exists:
         return generate_response_qwen_large, "Qwen 1.5B"
 
+    if thinker_4b_exists:
+        return generate_response_smallthinker_4b, "SmallThinker 4B"
+
     if thinker_exists:
         return generate_response_smallthinker, "SmallThinker 3B"
-    
-    if thinker_4B_exists:
-        return generate_response_smallthinker_4B, "SmallThinker 4B"
 
 
     # If neither file is present we default to the small path so downstream
@@ -769,8 +809,29 @@ def select_llama_cpp_generator(preference=None, *, qwen_preference=None):
         q_pref_to_use = pref
 
     recognized = smollm_alias | q_passthrough_alias | {
-        "", "auto", "0.5b", "0_5b", "1.5b", "1_5b", "small", "large", "default", "tiny",
-        "smallthinker", "thinker", "3b", "3_b", "fallback-small",
+        "",
+        "auto",
+        "0.5b",
+        "0_5b",
+        "1.5b",
+        "1_5b",
+        "small",
+        "large",
+        "default",
+        "tiny",
+        "smallthinker",
+        "thinker",
+        "3b",
+        "3_b",
+        "4b",
+        "4_b",
+        "smallthinker4b",
+        "smallthinker-4b",
+        "smallthinker_4b",
+        "thinker4b",
+        "thinker-4b",
+        "thinker_4b",
+        "fallback-small",
     }
     if pref_clean and pref not in recognized:
         print(
@@ -850,7 +911,7 @@ def main():
     print(f"[MAIN] Using llama.cpp variant: {model_label}")
 
 
-    out_text, model_reply_time, _tok_est = generator(
+    out_text, model_reply_time, _tok_est, resource_info, parsed_inference = generator(
         prompt_to_model,
         threads=4,
         temperature=0.2,
@@ -858,6 +919,9 @@ def main():
     if out_text is None:
         print("[MAIN] The selected llama.cpp model did not return output.")
         return
+
+    if not resource_info:
+        resource_info = _empty_resource_summary()
 
     # Clean minimal (our wrapper already strips noise/echo)
     cleaned = out_text.strip()
@@ -881,12 +945,20 @@ def main():
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
     print(f"Model reply time (wall): {model_reply_time:.3f}s")
-    print("Model inference time (parsed): N/A")
+    if parsed_inference is not None and parsed_inference > 0:
+        print(f"Model inference time (parsed): {parsed_inference:.3f}s")
+    else:
+        print("Model inference time (parsed): N/A")
     print(f"Tokens produced: {tokens}")
     print(f"TTS time: {tts_time:.3f}s")
     print(f"Total end-to-end: {total_elapsed:.3f}s")
-    print("Peak RSS: 0.0B, Avg RSS: 0.0B")  # not measured here
-    print("Peak CPU%: 0.0%, Avg CPU%: 0.0% (samples=0)")
+    peak_rss = resource_info.get("peak_rss") or 0
+    avg_rss = resource_info.get("avg_rss") or 0
+    peak_cpu = resource_info.get("peak_cpu") or 0.0
+    avg_cpu = resource_info.get("avg_cpu") or 0.0
+    samples = resource_info.get("samples") or 0
+    print(f"Peak RSS: {format_bytes(float(peak_rss))}, Avg RSS: {format_bytes(float(avg_rss))}")
+    print(f"Peak CPU%: {peak_cpu:.1f}%, Avg CPU%: {avg_cpu:.1f}% (samples={samples})")
     print("----------------------\n")
 
     return {
@@ -894,7 +966,9 @@ def main():
         "generated": cleaned,
         "bench_total": total_elapsed,
         "model_time": model_reply_time,
+        "model_inference_time": parsed_inference,
         "tts_time": tts_time,
+        "resource": resource_info,
         "engine": "qwen",
     }
 
