@@ -710,7 +710,7 @@ def main():
 
     
     
-    tts_time = speak_text_timed(cleaned)  
+    tts_time = speak_text_timed(generated)  
         
 
     total_elapsed = time.time() - total_start
