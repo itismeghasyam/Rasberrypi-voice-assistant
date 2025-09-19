@@ -444,7 +444,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
     return generated, elapsed, tokens
 
-def generate_response_qwen(user_text, n_predict=128, threads=4, temperature=0.2):
+def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
     """
     Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
     Uses the same contract as generate_response_local_llama.
@@ -452,33 +452,25 @@ def generate_response_qwen(user_text, n_predict=128, threads=4, temperature=0.2)
     exe = Path(LLAMA_CLI)
     model = Path(QWEN_MODEL)
 
-    if not exe.exists() or not model.exists():
-        missing = []
-        if not exe.exists():
-            missing.append("llama-cli")
-        if not model.exists():
-            missing.append("Qwen model")
-        print("[LLM] Qwen not available (missing {}).".format(", ".join(missing)))
-        return None, None, None
-
     prompt_escaped = user_text
     cmd = [
         str(exe),
         "-m", str(model),
-        "-p", prompt_escaped,
+        "-p", user_text,
         "-n", str(n_predict),
         "-t", str(threads),
         "--temp", str(temperature),
         "--top-p", "0.2",
         "--top-k", "40",
-        # NOTE: for simple single-turn Q&A, no chat template args needed.
-        # If you later want conversation formatting, you can explore --ctx-size, --repeat-penalty, etc.
+        "--simple-io",        # ensure pure non-interactive IO
+        "-ngl", "0",          # explicit: no GPU offload on Pi
+        "--ctx-size", "512",  # small context is enough here
     ]
 
     print("[LLM] Running Qwen (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 12)
     except subprocess.TimeoutExpired:
         print("[LLM] Qwen generation timed out")
         return None, None, None
@@ -570,7 +562,7 @@ def main():
         return
 
     out_text, model_reply_time, _tok_est = generate_response_qwen(
-        prompt_to_model, n_predict=128, threads=4, temperature=0.2
+        prompt_to_model, n_predict=32, threads=4, temperature=0.2
     )
     if out_text is None:
         print("[MAIN] Qwen did not return output.")
