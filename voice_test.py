@@ -37,7 +37,7 @@ QWEN_MODEL = QWEN_MODEL_SMALL
 
 # SmallThinker (local, via llama.cpp)
 SMALLTHINKER_MODEL = str(Path.home() / "Downloads" / "SmallThinker-3B-Preview.Q3_K_M.gguf")
-
+SMALLTHINKER_MODEL_4B = str(Path.home() / "Downloads" / "SmallThinker-4B-A0.6B-Instruct.Q3_K_S.gguf")
 # Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
 
 
@@ -606,6 +606,22 @@ def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperatu
         label="SmallThinker 3B",
     )
 
+def generate_response_smallthinker_4b(user_text, n_predict=64, threads=4, temperature=0.2):
+    """Run SmallThinker 4B-A0.6B Instruct (quant: Q3_K_S) via llama.cpp's llama-cli."""
+    return _run_qwen_llama_cpp(
+        SMALLTHINKER_MODEL_4B,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+            "--ctx-size", "1024",
+        ],
+        timeout_scale=20,
+        label="SmallThinker 4B",
+    )
 
 
 def select_qwen_generator(preference=None):
@@ -622,11 +638,18 @@ def select_qwen_generator(preference=None):
     small_exists = Path(QWEN_MODEL).exists()
 
     thinker_exists = Path(SMALLTHINKER_MODEL).exists()
+    
+    thinker_4b_exists = Path(SMALLTHINKER_MODEL_4B).exists()
 
     large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
     small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
     thinker_alias = {"smallthinker", "thinker", "3b", "3_b", "smallthinker-3b"}
+    thinker_4b_alias = {"smallthinker_4b", "thinker_4b", "4b", "4_b"}
 
+    if pref in thinker_4b_alias:
+        if thinker_4b_exists:
+            return generate_response_smallthinker_4b, "SmallThinker 4B"
+        
     if pref in thinker_alias:
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
@@ -657,8 +680,10 @@ def select_qwen_generator(preference=None):
 
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
+        if thinker_4b_exists:
+            return generate_response_smallthinker_4b, "SmallThinker 4B"
 
-    known_aliases = large_alias | small_alias | thinker_alias | {"auto", "fallback-small"}
+    known_aliases = large_alias | small_alias | thinker_alias | thinker_4b_alias |{"auto", "fallback-small"}
     if pref not in known_aliases and pref:
         print(
             f"[MAIN] Unknown variant '{pref_raw}'. Valid options: 0.5B/small, 1.5B/large, "
@@ -673,6 +698,8 @@ def select_qwen_generator(preference=None):
 
     if thinker_exists:
         return generate_response_smallthinker, "SmallThinker 3B"
+    if thinker_4b_exists:
+        return generate_response_smallthinker_4b, "SmallThinker 4B"
 
 
     # If neither file is present we default to the small path so downstream
