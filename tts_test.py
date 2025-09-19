@@ -17,7 +17,7 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-assistant" / "models"/ "gpt2.Q3_K_M.gguf")):
+def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-assistant" / "voices"/ "en_US-amy-medium.onnx")):
   
     text = (text or "").strip()
     if not text:
