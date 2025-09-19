@@ -705,8 +705,8 @@ def main():
     cleaned = "\n".join(cleaned_lines).strip()
 
     
-    print("\n[MAIN] Model reply (cleaned):")
-    print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
+    print("\n[MAIN] Model reply:")
+    print(generated if len(generated) < 2000 else generated[:2000] + "\n... (truncated)")
 
     
     
@@ -735,7 +735,7 @@ def main():
     print("----------------------\n")
 
     # 10) return full result for programmatic use
-    return {"transcription": transcribed, "cleaned": cleaned, "res": res, "bench_total": total_elapsed}
+    return {"transcription": transcribed, "generated": generated, "res": res, "bench_total": total_elapsed}
 
 
 if __name__ == "__main__":
