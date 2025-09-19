@@ -36,6 +36,7 @@ QWEN_MODEL_LARGE = str(Path.home() / "Downloads" / "qwen2.5-1.5b-instruct-q3_k_m
 QWEN_MODEL = QWEN_MODEL_SMALL
 # SmallThinker (local, via llama.cpp)
 SMALLTHINKER_MODEL = str(Path.home() / "Downloads" / "SmallThinker-3B-Preview.Q3_K_M.gguf")
+SMALLTHINKER_MODEL_4B = str(Path.home()/ "Downloads" / "SmallThinker-4B-A0.6B-Instruct.Q3_K_S.gguf" )
 # SmolLM (local, via llama.cpp)
 SMOLLM_MODEL = str(Path.home() / "Downloads" / "smollm-135m-instruct-add-basics-q8_0.gguf")
 # Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
@@ -398,7 +399,6 @@ def llama110(prompt_text: str,
 def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
-    sampler = ResourceSampler(interval=0.05)
 
     if not exe.exists() or not model.exists():
         missing = []
@@ -407,7 +407,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         if not model.exists():
             missing.append("local model")
         print("[LLM] Local llama not available (missing {}). Falling back to Ollama.".format(", ".join(missing)))
-        return None, None, None, sampler.summary()
+        return None, None, None
 
     prompt_escaped = prompt_text
     cmd = [
@@ -421,12 +421,9 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         "--top-k", "40",
     ]
 
-
+   
     print("[LLM] Running local llama:", " ".join(shlex.quote(c) for c in cmd))
-    sampler.start()
     start = time.time()
-    proc = None
-    timed_out = False
     try:
         # ensure llama.cpp does not try to switch into interactive mode by
         # providing an explicit non-tty stdin.
@@ -438,21 +435,15 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        timed_out = True
         print("[LLM] Local llama generation timed out")
-    finally:
-        # Ensure the sampler stops even if subprocess.run raises unexpectedly.
-        sampler.stop()
-
+        return None, None, None
     elapsed = time.time() - start
-    if timed_out or proc is None:
-        return None, None, None, sampler.summary()
 
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0, sampler.summary()
+        return "", elapsed, 0
 
-
+    
     generated = out
     if prompt_text.strip() and prompt_text.strip() in out:
         # split by the prompt and take the remainder
@@ -460,7 +451,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         if len(parts) > 1:
             generated = parts[-1].strip()
 
-
+    
     lines = [l for l in generated.splitlines() if l.strip()]
     if lines:
         generated = "\n".join(lines).strip()
@@ -470,9 +461,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     tps = tokens / elapsed if elapsed > 0 else 0.0
 
     print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-
-    return generated, elapsed, tokens, sampler.summary()
-
+    return generated, elapsed, tokens
 
 def _run_qwen_llama_cpp(
     model_path,
@@ -487,22 +476,19 @@ def _run_qwen_llama_cpp(
 ):
     """
     Shared helper to invoke llama.cpp with a given Qwen model and common hygiene.
-
-    Returns (generated_text, elapsed_seconds, token_estimate, resource_summary)
-    so callers can surface CPU/RSS statistics in their summaries.
+    Returns (generated_text, elapsed_seconds, token_estimate) just like the
+    legacy wrappers.
     """
     exe = Path(LLAMA_CLI)
     model = Path(model_path)
-    sampler = ResourceSampler(interval=0.05)
 
     if not exe.exists():
         print(f"[LLM] llama-cli binary not found: {exe}")
-        return None, None, None, sampler.summary()
+        return None, None, None
 
     if not model.exists():
         print(f"[LLM] {label} model not found: {model}")
-        return None, None, None, sampler.summary()
-
+        return None, None, None
 
     cmd = [
         str(exe),
@@ -519,12 +505,7 @@ def _run_qwen_llama_cpp(
         cmd.extend(extra_cli)
 
     print(f"[LLM] Running {label} (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
-
-    sampler.start()
-
     start = time.time()
-    proc = None
-    timed_out = False
     try:
         # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
         # exits once generation is finished instead of waiting for extra input.
@@ -534,21 +515,17 @@ def _run_qwen_llama_cpp(
             text=True,
 
             timeout=120 + n_predict * timeout_scale,
+
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        timed_out = True
         print(f"[LLM] {label} generation timed out")
-    finally:
-        sampler.stop()
-
+        return None, None, None
 
     elapsed = time.time() - start
-    if timed_out or proc is None:
-        return None, None, None, sampler.summary()
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0, sampler.summary()
+        return "", elapsed, 0
 
     # Strip echoed prompt if present
     generated = out
@@ -565,8 +542,7 @@ def _run_qwen_llama_cpp(
     tokens = len(generated.split())
     tps = tokens / elapsed if elapsed > 0 else 0.0
     print(f"[LLM] {label} generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-
-    return generated, elapsed, tokens, sampler.summary()
+    return generated, elapsed, tokens
 
 
 def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
@@ -611,6 +587,7 @@ def generate_response_qwen_large(user_text, n_predict=48, threads=4, temperature
     )
 
 
+
 def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperature=0.2):
     """Run SmallThinker 3B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
@@ -628,11 +605,10 @@ def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperatu
         label="SmallThinker 3B",
     )
 
-
-def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2):
-    """Run SmolLM 135M Instruct (quant: Q8_0) via llama.cpp's llama-cli."""
+def generate_response_smallthinker_4B(user_text, n_predict=64, threads=4, temperature=0.2):
+    """Run SmallThinker 4B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
-        SMOLLM_MODEL,
+        SMALLTHINKER_MODEL_4B,
         user_text,
         n_predict=n_predict,
         threads=threads,
@@ -640,10 +616,30 @@ def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2
         extra_cli=[
             "--simple-io",
             "-ngl", "0",
+            "--ctx-size", "1024",
+        ],
+        timeout_scale=20,
+        label="SmallThinker 4B",
+    )
+
+def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2):
+    """Run SmolLM 135M Instruct (quant: Q8_0) via llama.cpp's llama-cli."""
+    return _run_qwen_llama_cpp(
+        SMOLLM_MODEL,
+
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+
             "--ctx-size", "512",
         ],
         timeout_scale=8,
         label="SmolLM 135M",
+
     )
 
 
@@ -661,17 +657,26 @@ def select_qwen_generator(preference=None):
     small_exists = Path(QWEN_MODEL).exists()
 
     thinker_exists = Path(SMALLTHINKER_MODEL).exists()
+    thinker_4B_exists = Path(SMALLTHINKER_MODEL_4B).exists()
 
 
     large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
     small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
     thinker_alias = {"smallthinker", "thinker", "3b", "3_b", "smallthinker-3b"}
+    thinker_4B_alias = {"smallthinker_4B", "thinker_4b", "4b", "4_b", "smallthinker-4b"}
+
 
 
     if pref in thinker_alias:
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
         print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL}. Falling back to Qwen options.")
+        pref = "fallback-small"
+        
+    if pref in thinker_4B_alias:
+        if thinker_4B_exists:
+            return generate_response_smallthinker, "SmallThinker 4B"
+        print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL_4B}. Falling back to Qwen options.")
         pref = "fallback-small"
 
 
@@ -698,6 +703,9 @@ def select_qwen_generator(preference=None):
 
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
+        if thinker_4B_exists:
+            return generate_response_smallthinker_4B, "SmallThinker 4B"
+        
 
     known_aliases = large_alias | small_alias | thinker_alias | {"auto", "fallback-small"}
 
@@ -715,6 +723,9 @@ def select_qwen_generator(preference=None):
 
     if thinker_exists:
         return generate_response_smallthinker, "SmallThinker 3B"
+    
+    if thinker_4B_exists:
+        return generate_response_smallthinker_4B, "SmallThinker 4B"
 
 
     # If neither file is present we default to the small path so downstream
@@ -838,28 +849,12 @@ def main():
     generator, model_label = select_llama_cpp_generator(qwen_preference=qwen_pref)
     print(f"[MAIN] Using llama.cpp variant: {model_label}")
 
-    result = generator(
 
+    out_text, model_reply_time, _tok_est = generator(
         prompt_to_model,
         threads=4,
         temperature=0.2,
     )
-    out_text = None
-    model_reply_time = None
-    tok_estimate = None
-    resource_stats = None
-    if isinstance(result, tuple):
-        if len(result) > 0:
-            out_text = result[0]
-        if len(result) > 1:
-            model_reply_time = result[1]
-        if len(result) > 2:
-            tok_estimate = result[2]
-        if len(result) > 3:
-            resource_stats = result[3]
-    else:
-        out_text = result
-
     if out_text is None:
         print("[MAIN] The selected llama.cpp model did not return output.")
         return
@@ -867,10 +862,6 @@ def main():
     # Clean minimal (our wrapper already strips noise/echo)
     cleaned = out_text.strip()
     tokens = len(cleaned.split())
-    if tok_estimate is not None and tok_estimate > 0:
-        tokens = tok_estimate
-
-    resource_stats = resource_stats or {}
 
     print("\n[MAIN] Model reply:")
     print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
@@ -885,36 +876,26 @@ def main():
             tts_time = time.time() - tts_start
 
     total_elapsed = time.time() - total_start
-    if isinstance(model_reply_time, (int, float)):
-        model_reply_seconds = float(model_reply_time)
-    else:
-        model_reply_seconds = 0.0
 
     # Bench summary
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
-    print(f"Model reply time (wall): {model_reply_seconds:.3f}s")
+    print(f"Model reply time (wall): {model_reply_time:.3f}s")
     print("Model inference time (parsed): N/A")
     print(f"Tokens produced: {tokens}")
     print(f"TTS time: {tts_time:.3f}s")
     print(f"Total end-to-end: {total_elapsed:.3f}s")
-    peak_rss = float(resource_stats.get("peak_rss", 0) or 0)
-    avg_rss = float(resource_stats.get("avg_rss", 0) or 0)
-    peak_cpu = float(resource_stats.get("peak_cpu", 0.0) or 0.0)
-    avg_cpu = float(resource_stats.get("avg_cpu", 0.0) or 0.0)
-    samples = int(resource_stats.get("samples", 0) or 0)
-    print(f"Peak RSS: {format_bytes(peak_rss)}, Avg RSS: {format_bytes(avg_rss)}")
-    print(f"Peak CPU%: {peak_cpu:.1f}%, Avg CPU%: {avg_cpu:.1f}% (samples={samples})")
+    print("Peak RSS: 0.0B, Avg RSS: 0.0B")  # not measured here
+    print("Peak CPU%: 0.0%, Avg CPU%: 0.0% (samples=0)")
     print("----------------------\n")
 
     return {
         "transcription": transcribed,
         "generated": cleaned,
         "bench_total": total_elapsed,
-        "model_time": model_reply_seconds,
+        "model_time": model_reply_time,
         "tts_time": tts_time,
         "engine": "qwen",
-        "resource": resource_stats,
     }
 
 if __name__ == "__main__":
