@@ -370,7 +370,7 @@ def benchmark_once_vosk(audio_path, model_dir= str(Path.home() / "models" / "vos
 # CLI 
 def parse_args():
     p = argparse.ArgumentParser(description="STT benchmarks (Faster-Whisper or Vosk)")
-    p.add_argument("--engine", choices=["fw", "vosk","distil","whisper"], default="fw",
+    p.add_argument("--engine", choices=["fw", "vosk","distil","whispercpp"], default="fw",
                    help="Engine to benchmark: fw (Faster-Whisper) or vosk")
     p.add_argument("--models", type=str, default="tiny",
                    help="FW: comma-separated models (e.g., tiny or tiny,base). Ignored for Vosk.")
