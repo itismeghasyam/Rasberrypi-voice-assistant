@@ -24,7 +24,7 @@ model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-
 def speak_text_piper(text: str, model_path=model_path):
     """
     Speak text using Piper TTS engine and play via PulseAudio (BT speakers).
-    Outputs a proper WAV file so paplay can handle it.
+    Converts Piper's raw PCM into a valid WAV.
     """
     text = (text or "").strip()
     if not text:
@@ -36,25 +36,26 @@ def speak_text_piper(text: str, model_path=model_path):
         # Load Piper model
         model = piper.PiperVoice.load(model_path)
 
-        # Generate raw PCM samples (float32)
-        samples = np.array(list(model.synthesize_stream_raw(text)), dtype=np.float32)
+        # Capture raw PCM output into memory buffer
+        buffer = io.BytesIO()
+        model.synthesize(text, buffer)
 
-        # Convert to 16-bit PCM
-        pcm16 = (samples * 32767).astype(np.int16)
+        # Get raw bytes and convert to numpy
+        raw_bytes = buffer.getvalue()
+        samples = np.frombuffer(raw_bytes, dtype=np.int16)
 
         # Save as proper WAV
         with wave.open("piper_output.wav", "wb") as wf:
-            wf.setnchannels(1)       # mono
-            wf.setsampwidth(2)       # 16-bit
-            wf.setframerate(22050)   # sample rate
-            wf.writeframes(pcm16.tobytes())
+            wf.setnchannels(1)        # mono
+            wf.setsampwidth(2)        # 16-bit
+            wf.setframerate(22050)    # sample rate (Piper default for Amy medium)
+            wf.writeframes(samples.tobytes())
 
-        # Play with PulseAudio (Bluetooth)
+        # Play via PulseAudio (Bluetooth)
         subprocess.run(["paplay", "piper_output.wav"], check=True)
 
     except Exception as e:
         print("[TTS] Piper failed:", e)
-
 def benchmark_tts(tts_func, text: str, engine_name: str):
     """
     Benchmark a TTS function: measures response time and resource usage.
