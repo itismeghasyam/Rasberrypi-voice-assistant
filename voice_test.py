@@ -403,20 +403,18 @@ def run_qwen_once(prompt: str,
     if model_path is None:
         model_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
 
-    cmd = [
-        str(Path(llama_cli)),
-        "-m", str(Path(model_path)),
+        cmd = [
+        str(exe),
+        "-m", str(model),
         "-p", prompt,
         "-n", str(n_predict),
         "-t", str(threads),
         "--temp", str(temp),
+        "--simple-io",     # prints only the generation (no extra prompts)
+        # Optional: uncomment if your build supports it and you want templating
+        # "--instruct",
+        ]
 
-        # IMPORTANT: prevent interactive chat + suppress logs
-        "-no-cnv",         # disable conversation mode
-        "--single-turn",   # exit after the single response
-        "--log-disable",   # try to hide loader logging
-        "--no-warmup",     # optional: skip warmup prints
-    ]
 
     start = time.time()
     try:
