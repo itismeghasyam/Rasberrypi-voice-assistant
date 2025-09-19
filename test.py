@@ -220,19 +220,19 @@ def main():
     text = "What is one plus one"
     
     generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2.Q3_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
-    print("[MAIN] Model replied (local):", generated)
+    print("[MAIN] gpt2-Q3 replied (local):", generated)
     if elapsed is not None:
         approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
         print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
     
     generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2.Q4_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
-    print("[MAIN] Model replied (local):", generated)
+    print("[MAIN] gpt2-Q4 replied (local):", generated)
     if elapsed is not None:
         approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
         print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
 
     generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2-medium-Q4_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
-    print("[MAIN] Model replied (local):", generated)
+    print("[MAIN] gpt2-medium-Q4 replied (local):", generated)
     if elapsed is not None:
         approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
         print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
