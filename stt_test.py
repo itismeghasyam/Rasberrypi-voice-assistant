@@ -16,8 +16,8 @@ RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 DURATION_SEC = 6
 DEVICE = "cpu"
-COMPUTE_TYPE = "int8"   # try "int16" if you want a bit more accuracy on CPU
-CPU_THREADS = None      # e.g., set to 4 to pin threads, else CTranslate2 decides
+COMPUTE_TYPE = "int8"   
+CPU_THREADS = 4  
 
 
 def record_wav(path=RECORDED_WAV, duration=DURATION_SEC, sr=SAMPLE_RATE):
