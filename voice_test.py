@@ -23,7 +23,7 @@ WHISPER_MODEL = str(Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin")
 
 # Local LLM
 LLAMA_CLI = str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
-LOCAL_MODEL = str(Path.home() / "models" / "phi-2.Q4_K_M.gguf")
+LOCAL_MODEL = str(Path.home() / "models" / "gpt2.Q3_K_M.gguf")
 
 # Ollama 
 OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
