@@ -538,103 +538,80 @@ def format_bytes(n):
 
 def main():
     total_start = time.time()
-    """
-    #  record
-    wav = record_wav()
-    if not wav:
-        print("[MAIN] Recording failed.")
-        return
-    """
+
+    # Use existing wav
     wav = str(Path.home() / "Rasberrypi-voice-assistant" / "recorded.wav")
-    
-    #  STT
+
+    # --- STT ---
     stt_start = time.time()
     transcribed = transcribe_audio(wav)
     stt_elapsed = time.time() - stt_start
     print(f"[MAIN] Transcription (STT time {stt_elapsed:.3f}s): {repr(transcribed)}")
-
     if not transcribed:
         print("[MAIN] No transcription found.")
         return
 
-    
+    # --- Prompt ---
     short_prefix = "Answer in one short sentence. "
     prompt_to_model = short_prefix + transcribed.strip()
-    sampler = ResourceSampler(interval=0.05)
-    """
-    # llama110 
-    
-    llama2_model_path = str(Path.home() / "Downloads" / "llama2.c-stories110M-pruned50.Q3_K_M.gguf")
-    try:
-        res = llama110(
-            prompt_text=prompt_to_model,
-            llama_cli_path=LLAMA_CLI,
-            model_path=llama2_model_path,
-            n_predict=64,        # limit generation length
-            threads=4,
-            temperature=0.1,     # low temp to prefer concise answers
-            sampler=sampler,
-            tts_after=False,
-            timeout_seconds=90
-        )
-    except FileNotFoundError as e:
-        print("[MAIN] Error launching llama110:", e)
-        return
-"""
 
+    # --- Qwen (via llama-cli) ---
     qwen_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
-    res = run_qwen_once(prompt_to_model, llama_cli=LLAMA_CLI, model_path=qwen_path, n_predict=16, threads=2, temp=0.1, timeout=600)
+    res = run_qwen_once(
+        prompt_to_model,
+        llama_cli=LLAMA_CLI,
+        model_path=qwen_path,
+        n_predict=16,
+        threads=2,
+        temp=0.1,
+        timeout=600
+    )
 
+    raw_out = (res.get("stdout") or "").strip()
+    raw_err = (res.get("stderr") or "").strip()
+    model_reply_time = float(res.get("elapsed") or 0.0)
 
-        
-        
-    generated = res.get("generated", "")
-    model_reply_time = res.get("model_reply_time", 0.0)
-    model_inference_time = res.get("model_inference_time", None)
-    tokens = res.get("tokens", 0)
+    # Prefer stdout; fall back to stderr
+    generated = raw_out if raw_out else raw_err
 
-    
-    cleaned = generated
-    if prompt_to_model.strip() and prompt_to_model.strip() in cleaned:
-        
-        cleaned = cleaned.split(prompt_to_model.strip(), 1)[-1].strip()
+    # Strip echoed prompt if present
+    if prompt_to_model.strip() and prompt_to_model.strip() in generated:
+        generated = generated.split(prompt_to_model.strip(), 1)[-1].strip()
 
-    
-    cleaned_lines = [ln for ln in cleaned.splitlines() if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace"))]
+    # Remove common llama.cpp noise lines
+    cleaned_lines = [
+        ln for ln in generated.splitlines()
+        if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace"))
+    ]
     cleaned = "\n".join(cleaned_lines).strip()
 
-    
-    print("\n[MAIN] Model reply:")
-    print(generated if len(generated) < 2000 else generated[:2000] + "\n... (truncated)")
+    tokens = len(cleaned.split())
 
-    
-    
-    tts_time = speak_text_timed(generated)  
-        
+    print("\n[MAIN] Model reply:")
+    print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
+
+    tts_time = speak_text_timed(cleaned)
 
     total_elapsed = time.time() - total_start
-    stats = res.get("resource", {})
 
-    # 9) Print bench summary
+    # Bench summary (resource stats not available for run_qwen_once)
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
     print(f"Model reply time (wall): {model_reply_time:.3f}s")
-    if model_inference_time is not None:
-        print(f"Model inference time (parsed): {model_inference_time:.3f}s")
-    else:
-        print("Model inference time (parsed): N/A")
+    print("Model inference time (parsed): N/A")
     print(f"Tokens produced: {tokens}")
     print(f"TTS time: {tts_time:.3f}s")
     print(f"Total end-to-end: {total_elapsed:.3f}s")
-    if isinstance(stats, dict):
-        peak = stats.get("peak_rss", 0)
-        avg = int(stats.get("avg_rss", 0))
-        print(f"Peak RSS: {format_bytes(peak)}, Avg RSS: {format_bytes(avg)}")
-        print(f"Peak CPU%: {stats.get('peak_cpu',0.0):.1f}%, Avg CPU%: {stats.get('avg_cpu',0.0):.1f}% (samples={stats.get('samples',0)})")
+    print("Peak RSS: 0.0B, Avg RSS: 0.0B")  # not measured here
+    print("Peak CPU%: 0.0%, Avg CPU%: 0.0% (samples=0)")
     print("----------------------\n")
 
-    # 10) return full result for programmatic use
-    return {"transcription": transcribed, "generated": generated, "res": res, "bench_total": total_elapsed}
+    return {
+        "transcription": transcribed,
+        "generated": cleaned,
+        "res": res,
+        "bench_total": total_elapsed
+    }
 
 
 if __name__ == "__main__":
