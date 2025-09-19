@@ -34,8 +34,10 @@ QWEN_MODEL_SMALL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m
 QWEN_MODEL_LARGE = str(Path.home() / "Downloads" / "qwen2.5-1.5b-instruct-q3_k_m.gguf")
 # Maintain backwards compatibility with older references expecting QWEN_MODEL
 QWEN_MODEL = QWEN_MODEL_SMALL
+
 # SmallThinker (local, via llama.cpp)
 SMALLTHINKER_MODEL = str(Path.home() / "Downloads" / "SmallThinker-3B-Preview.Q3_K_M.gguf")
+
 # Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
 
 
@@ -508,7 +510,13 @@ def _run_qwen_llama_cpp(
             cmd,
             capture_output=True,
             text=True,
+
             timeout=120 + n_predict * timeout_scale,
+
+
+            
+
+
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
@@ -580,6 +588,7 @@ def generate_response_qwen_large(user_text, n_predict=48, threads=4, temperature
     )
 
 
+
 def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperature=0.2):
     """Run SmallThinker 3B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
@@ -611,6 +620,7 @@ def select_qwen_generator(preference=None):
 
     large_exists = Path(QWEN_MODEL_LARGE).exists()
     small_exists = Path(QWEN_MODEL).exists()
+
     thinker_exists = Path(SMALLTHINKER_MODEL).exists()
 
     large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
@@ -622,6 +632,7 @@ def select_qwen_generator(preference=None):
             return generate_response_smallthinker, "SmallThinker 3B"
         print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL}. Falling back to Qwen options.")
         pref = "fallback-small"
+
 
     if pref in large_alias:
         if large_exists:
@@ -643,6 +654,7 @@ def select_qwen_generator(preference=None):
             return generate_response_qwen_large, "Qwen 1.5B"
         if small_exists:
             return generate_response_qwen, "Qwen 0.5B"
+
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
 
@@ -653,12 +665,15 @@ def select_qwen_generator(preference=None):
             "SmallThinker, auto."
         )
 
+
     if small_exists:
         return generate_response_qwen, "Qwen 0.5B"
     if large_exists:
         return generate_response_qwen_large, "Qwen 1.5B"
+
     if thinker_exists:
         return generate_response_smallthinker, "SmallThinker 3B"
+
 
     # If neither file is present we default to the small path so downstream
     # errors point at the expected location.
