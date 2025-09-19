@@ -221,6 +221,48 @@ class ResourceSampler:
         }
 
 
+def _empty_resource_summary():
+    """Return a fresh zeroed resource summary mapping."""
+    return {
+        "peak_rss": 0,
+        "avg_rss": 0,
+        "peak_cpu": 0.0,
+        "avg_cpu": 0.0,
+        "samples": 0,
+    }
+
+
+def _parse_llama_timing(raw_text):
+    """Best-effort extraction of an inference time from llama.cpp output."""
+    if not raw_text:
+        return None
+
+    patterns = [
+        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"model(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
+        r"([0-9]*\.?[0-9]+)\s*ms\b",
+        r"([0-9]*\.?[0-9]+)\s*s\b",
+    ]
+
+    for pat in patterns:
+        for match in re.finditer(pat, raw_text, flags=re.IGNORECASE):
+            num = match.group(1)
+            unit = match.group(2) if match.lastindex and match.lastindex >= 2 else None
+            try:
+                val = float(num)
+                if unit and unit.lower().startswith("ms"):
+                    val = val / 1000.0
+                if val > 0:
+                    return val
+            except Exception:
+                continue
+
+    return None
+
+
 # small TTS wrapper
 
 def speak_text_timed(text: str, cmd=None):
@@ -354,34 +396,7 @@ def llama110(prompt_text: str,
 
     # Attempt to parse model-reported inference timings, e.g. lines like "inference time: 123.45 ms"
     # This is best-effort: look for numbers followed by 'ms' or 's' near keywords.
-    inference_time = None
-    # common patterns: "inference time: 123.4 ms", "total time: 1.23s", "real time: 0.123s"
-    patterns = [
-        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"model(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
-        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
-        r"([0-9]*\.?[0-9]+)\s*ms\b",
-        r"([0-9]*\.?[0-9]+)\s*s\b",
-    ]
-    for pat in patterns:
-        for match in re.finditer(pat, raw_combined, flags=re.IGNORECASE):
-            num = match.group(1)
-            unit = match.group(2) if match.lastindex and match.lastindex >= 2 else None
-            try:
-                val = float(num)
-                if unit and unit.lower().startswith("ms"):
-                    val = val / 1000.0
-                # prefer a small positive non-zero inference_time
-                if val > 0:
-                    inference_time = val
-                    break
-            except Exception:
-                continue
-        if inference_time is not None:
-            break
-
+    inference_time = _parse_llama_timing(raw_combined)
     # If we didn't find a specific model-reported time, keep None (so caller can differentiate)
     result["model_inference_time"] = inference_time
 
@@ -476,19 +491,20 @@ def _run_qwen_llama_cpp(
 ):
     """
     Shared helper to invoke llama.cpp with a given Qwen model and common hygiene.
-    Returns (generated_text, elapsed_seconds, token_estimate) just like the
-    legacy wrappers.
+    Returns (generated_text, elapsed_seconds, token_estimate, resource_summary,
+    parsed_inference_time) just like the legacy wrappers but with additional
+    runtime metrics.
     """
     exe = Path(LLAMA_CLI)
     model = Path(model_path)
 
     if not exe.exists():
         print(f"[LLM] llama-cli binary not found: {exe}")
-        return None, None, None
+        return None, None, None, _empty_resource_summary(), None
 
     if not model.exists():
         print(f"[LLM] {label} model not found: {model}")
-        return None, None, None
+        return None, None, None, _empty_resource_summary(), None
 
     cmd = [
         str(exe),
@@ -506,6 +522,9 @@ def _run_qwen_llama_cpp(
 
     print(f"[LLM] Running {label} (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
+    sampler = ResourceSampler(interval=0.05)
+    sampler.start()
+    timeout_seconds = 120 + n_predict * timeout_scale
     try:
         # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
         # exits once generation is finished instead of waiting for extra input.
@@ -514,18 +533,28 @@ def _run_qwen_llama_cpp(
             capture_output=True,
             text=True,
 
-            timeout=120 + n_predict * timeout_scale,
+            timeout=timeout_seconds,
 
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         print(f"[LLM] {label} generation timed out")
-        return None, None, None
+        sampler.stop()
+        elapsed = time.time() - start
+        resource_summary = sampler.summary()
+        return None, elapsed, 0, resource_summary, None
+    except Exception:
+        sampler.stop()
+        raise
+    else:
+        sampler.stop()
 
     elapsed = time.time() - start
+    resource_summary = sampler.summary()
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0
+        inference_time = _parse_llama_timing((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else ""))
+        return "", elapsed, 0, resource_summary, inference_time
 
     # Strip echoed prompt if present
     generated = out
@@ -542,7 +571,9 @@ def _run_qwen_llama_cpp(
     tokens = len(generated.split())
     tps = tokens / elapsed if elapsed > 0 else 0.0
     print(f"[LLM] {label} generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-    return generated, elapsed, tokens
+    raw_combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    inference_time = _parse_llama_timing(raw_combined)
+    return generated, elapsed, tokens, resource_summary, inference_time
 
 
 def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
@@ -880,7 +911,7 @@ def main():
     print(f"[MAIN] Using llama.cpp variant: {model_label}")
 
 
-    out_text, model_reply_time, _tok_est = generator(
+    out_text, model_reply_time, _tok_est, resource_info, parsed_inference = generator(
         prompt_to_model,
         threads=4,
         temperature=0.2,
@@ -888,6 +919,9 @@ def main():
     if out_text is None:
         print("[MAIN] The selected llama.cpp model did not return output.")
         return
+
+    if not resource_info:
+        resource_info = _empty_resource_summary()
 
     # Clean minimal (our wrapper already strips noise/echo)
     cleaned = out_text.strip()
@@ -911,12 +945,20 @@ def main():
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
     print(f"Model reply time (wall): {model_reply_time:.3f}s")
-    print("Model inference time (parsed): N/A")
+    if parsed_inference is not None and parsed_inference > 0:
+        print(f"Model inference time (parsed): {parsed_inference:.3f}s")
+    else:
+        print("Model inference time (parsed): N/A")
     print(f"Tokens produced: {tokens}")
     print(f"TTS time: {tts_time:.3f}s")
     print(f"Total end-to-end: {total_elapsed:.3f}s")
-    print("Peak RSS: 0.0B, Avg RSS: 0.0B")  # not measured here
-    print("Peak CPU%: 0.0%, Avg CPU%: 0.0% (samples=0)")
+    peak_rss = resource_info.get("peak_rss") or 0
+    avg_rss = resource_info.get("avg_rss") or 0
+    peak_cpu = resource_info.get("peak_cpu") or 0.0
+    avg_cpu = resource_info.get("avg_cpu") or 0.0
+    samples = resource_info.get("samples") or 0
+    print(f"Peak RSS: {format_bytes(float(peak_rss))}, Avg RSS: {format_bytes(float(avg_rss))}")
+    print(f"Peak CPU%: {peak_cpu:.1f}%, Avg CPU%: {avg_cpu:.1f}% (samples={samples})")
     print("----------------------\n")
 
     return {
@@ -924,7 +966,9 @@ def main():
         "generated": cleaned,
         "bench_total": total_elapsed,
         "model_time": model_reply_time,
+        "model_inference_time": parsed_inference,
         "tts_time": tts_time,
+        "resource": resource_info,
         "engine": "qwen",
     }
 
