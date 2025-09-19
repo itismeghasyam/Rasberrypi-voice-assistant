@@ -128,7 +128,7 @@ def transcribe_audio(wav_path):
 
     return ""
 
-def generate_response_local_llama(prompt_text, n_predict=16, threads=4, temperature=0.1):
+def generate_response_local_llama(LOCAL_MODEL,prompt_text, n_predict=16, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
 
@@ -218,19 +218,24 @@ def generate_response_ollama(user_text, timeout=30):
 def main():
     
     text = "What is one plus one"
-    # Try local llama first
-    generated, elapsed, tokens = generate_response_local_llama(text, n_predict=128, threads=4, temperature=0.8)
-    if generated is None:
-        # fallback to Ollama cloud/other host
-        print("error with generating response")
-        return
-
     
+    generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2.Q3_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
     print("[MAIN] Model replied (local):", generated)
     if elapsed is not None:
         approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
         print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
-    speak_text(generated)
+    
+    generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2.Q4_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
+    print("[MAIN] Model replied (local):", generated)
+    if elapsed is not None:
+        approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
+        print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
+
+    generated, elapsed, tokens = generate_response_local_llama(LOCAL_MODEL=str(Path.home() / "models"/ "gpt2-medium-Q4_K_M.gguf"), prompt_text=text, n_predict=16, threads=2, temperature=0.8)
+    print("[MAIN] Model replied (local):", generated)
+    if elapsed is not None:
+        approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
+        print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
 
 if __name__ == "__main__":
     main()
