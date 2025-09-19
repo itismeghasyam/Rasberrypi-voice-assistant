@@ -2,7 +2,7 @@ import subprocess
 import time
 import psutil
 import os
-
+import piper
 
 def speak_text_espeak(text: str) -> None:
     
@@ -17,7 +17,28 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
+def speak_text_piper(text: str, model_path="voices/en_US-amy-medium.onnx"):
+    """
+    Speak text using Piper TTS engine.
+    Requires a downloaded ONNX voice model.
+    """
+    text = (text or "").strip()
+    if not text:
+        return
 
+    print("[TTS] Piper Speak:", text)
+
+    try:
+        # Initialize Piper (lazy-load)
+        model = piper.PiperVoice.load(model_path)
+        # Stream audio directly (or save to file)
+        with open("piper_output.wav", "wb") as f:
+            model.synthesize(text, f)
+
+        # Play audio file
+        subprocess.run(["aplay", "piper_output.wav"], check=True)
+    except Exception as e:
+        print("[TTS] Piper failed:", e)
 
 def benchmark_tts(tts_func, text: str, engine_name: str):
     """
@@ -51,7 +72,7 @@ def benchmark_tts(tts_func, text: str, engine_name: str):
 
 if __name__ == "__main__":
     input_text = "Hello, How are you"
-    result = benchmark_tts(speak_text_espeak, input_text, "espeak")
+    result = benchmark_tts(speak_text_piper, input_text, "piper")
 
     print("\n=== Benchmark Result ===")
     for k, v in result.items():
