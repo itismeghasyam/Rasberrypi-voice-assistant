@@ -42,6 +42,7 @@ SMOLLM_MODEL = str(Path.home() / "Downloads" / "smollm-135m-instruct-add-basics-
 # Set LLM_MODEL_VARIANT=smollm to target the SmolLM plug explicitly.
 
 
+
 _tts_engine = None
 
 def speak_text(text: str):
@@ -511,7 +512,9 @@ def _run_qwen_llama_cpp(
             cmd,
             capture_output=True,
             text=True,
+
             timeout=120 + n_predict * timeout_scale,
+
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
@@ -583,6 +586,7 @@ def generate_response_qwen_large(user_text, n_predict=48, threads=4, temperature
     )
 
 
+
 def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperature=0.2):
     """Run SmallThinker 3B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
@@ -601,10 +605,12 @@ def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperatu
     )
 
 
+
 def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2):
     """Run SmolLM 135M Instruct (quant: Q8_0) via llama.cpp's llama-cli."""
     return _run_qwen_llama_cpp(
         SMOLLM_MODEL,
+
         user_text,
         n_predict=n_predict,
         threads=threads,
@@ -612,10 +618,12 @@ def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2
         extra_cli=[
             "--simple-io",
             "-ngl", "0",
+
             "--ctx-size", "512",
         ],
         timeout_scale=8,
         label="SmolLM 135M",
+
     )
 
 
@@ -631,17 +639,22 @@ def select_qwen_generator(preference=None):
 
     large_exists = Path(QWEN_MODEL_LARGE).exists()
     small_exists = Path(QWEN_MODEL).exists()
+
     thinker_exists = Path(SMALLTHINKER_MODEL).exists()
+
 
     large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
     small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
     thinker_alias = {"smallthinker", "thinker", "3b", "3_b", "smallthinker-3b"}
+
+
 
     if pref in thinker_alias:
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
         print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL}. Falling back to Qwen options.")
         pref = "fallback-small"
+
 
     if pref in large_alias:
         if large_exists:
@@ -663,26 +676,32 @@ def select_qwen_generator(preference=None):
             return generate_response_qwen_large, "Qwen 1.5B"
         if small_exists:
             return generate_response_qwen, "Qwen 0.5B"
+
         if thinker_exists:
             return generate_response_smallthinker, "SmallThinker 3B"
 
     known_aliases = large_alias | small_alias | thinker_alias | {"auto", "fallback-small"}
+
     if pref not in known_aliases and pref:
         print(
             f"[MAIN] Unknown variant '{pref_raw}'. Valid options: 0.5B/small, 1.5B/large, "
             "SmallThinker, auto."
         )
 
+
     if small_exists:
         return generate_response_qwen, "Qwen 0.5B"
     if large_exists:
         return generate_response_qwen_large, "Qwen 1.5B"
+
     if thinker_exists:
         return generate_response_smallthinker, "SmallThinker 3B"
+
 
     # If neither file is present we default to the small path so downstream
     # errors point at the expected location.
     return generate_response_qwen, "Qwen 0.5B"
+
 
 
 def select_llama_cpp_generator(preference=None, *, qwen_preference=None):
@@ -730,6 +749,7 @@ def select_llama_cpp_generator(preference=None, *, qwen_preference=None):
         )
 
     return select_qwen_generator(q_pref_to_use)
+
 
 
 def generate_response_ollama(user_text, timeout=30):
@@ -795,8 +815,10 @@ def main():
         return
 
     qwen_pref = os.environ.get("QWEN_MODEL_VARIANT")
+
     generator, model_label = select_llama_cpp_generator(qwen_preference=qwen_pref)
     print(f"[MAIN] Using llama.cpp variant: {model_label}")
+
 
     out_text, model_reply_time, _tok_est = generator(
         prompt_to_model,
