@@ -30,6 +30,7 @@ OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
 OLLAMA_MODEL = "mistral"
 
 
+
 _tts_engine = None
 
 def speak_text(text: str):
@@ -127,6 +128,260 @@ def transcribe_audio(wav_path):
         return txt
 
     return ""
+# Insert these functions into your script. Requires `psutil` (pip install psutil).
+
+import time
+import shlex
+import subprocess
+import threading
+import re
+import os
+from pathlib import Path
+
+try:
+    import psutil
+except Exception:
+    psutil = None  # ResourceSampler will be a no-op if psutil isn't installed
+
+# -------------------------
+# Resource sampler (optional)
+# -------------------------
+class ResourceSampler:
+    """
+    Sample current process RSS and CPU% at `interval` seconds in background.
+    Call start() before a heavy operation and stop() afterwards.
+    summary() returns a dict: peak_rss, avg_rss, peak_cpu, avg_cpu, samples.
+    If psutil is not available this becomes a minimal no-op sampler.
+    """
+    def __init__(self, interval=0.05):
+        self.interval = float(interval)
+        self._running = False
+        self._thread = None
+        self.samples = []  # [(ts, rss_bytes, cpu_percent), ...]
+        if psutil:
+            self._proc = psutil.Process(os.getpid())
+        else:
+            self._proc = None
+
+    def _loop(self):
+        # warm-up cpu_percent baseline
+        try:
+            if self._proc: self._proc.cpu_percent(interval=None)
+        except Exception:
+            pass
+        while self._running:
+            try:
+                if self._proc:
+                    rss = self._proc.memory_info().rss
+                    cpu = self._proc.cpu_percent(interval=None)
+                else:
+                    rss = 0
+                    cpu = 0.0
+                self.samples.append((time.time(), rss, cpu))
+            except Exception:
+                # ignore sampling failures
+                pass
+            time.sleep(self.interval)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def summary(self):
+        if not self.samples:
+            return {"peak_rss": 0, "avg_rss": 0, "peak_cpu": 0.0, "avg_cpu": 0.0, "samples": 0}
+        rss_vals = [s[1] for s in self.samples]
+        cpu_vals = [s[2] for s in self.samples]
+        return {
+            "peak_rss": max(rss_vals),
+            "avg_rss": sum(rss_vals) / len(rss_vals),
+            "peak_cpu": max(cpu_vals),
+            "avg_cpu": sum(cpu_vals) / len(cpu_vals),
+            "samples": len(self.samples),
+        }
+
+
+# small TTS wrapper
+
+def speak_text_timed(text: str, cmd=None):
+    """
+    Very small wrapper that runs a TTS command and returns elapsed seconds.
+    Default uses `espeak text`. If you use a different TTS, pass `cmd` as a list,
+    e.g. ['tts-cli', '--out', '/tmp/out.wav', text] or similar.
+    """
+    text = (text or "").strip()
+    if not text:
+        return 0.0
+    if cmd is None:
+        # default simple espeak call; replace if you need a different TTS
+        cmd = ["espeak", text]
+    else:
+        # allow passing a format-string or a list; convert format-string to shell-safe list
+        if isinstance(cmd, str):
+            # user provided something like "mytts --text '{}'"
+            safe = cmd.format(shlex.quote(text))
+            cmd = shlex.split(safe)
+        elif isinstance(cmd, (list, tuple)):
+            # if list contains {} we substitute with text
+            cmd = [c.format(text) if ("{}" in c or "{text}" in c) else c for c in cmd]
+    t0 = time.time()
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception:
+        # swallow TTS errors but still return elapsed
+        pass
+    return time.time() - t0
+
+# llama110 main function
+def llama110(prompt_text: str,
+             llama_cli_path: str = None,
+             model_path: str = None,
+             n_predict: int = 16,
+             threads: int = 4,
+             temperature: float = 0.2,
+             sampler: ResourceSampler = None,
+             tts_after: bool = False,
+             tts_cmd = None,
+             timeout_seconds: int = 240):
+    
+
+    # sensible defaults (do not overwrite your other model; use explicit path if you have one)
+    if llama_cli_path is None:
+        llama_cli_path = str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
+    if model_path is None:
+        model_path = str(Path.home() / "Downloads" / "llama2.c-stories110M-pruned50.Q3_K_M.gguf")
+
+    exe = Path(llama_cli_path)
+    model = Path(model_path)
+
+    result = {
+        "generated": "",
+        "model_reply_time": 0.0,
+        "model_inference_time": None,
+        "tokens": 0,
+        "tts_time": 0.0,
+        "resource": {"peak_rss":0, "avg_rss":0, "peak_cpu":0.0, "avg_cpu":0.0, "samples":0},
+        "raw_stdout": None,
+        "raw_stderr": None,
+    }
+
+    if sampler is None:
+        sampler = ResourceSampler(interval=0.05)  # local no-op if psutil missing
+
+    if not exe.exists():
+        raise FileNotFoundError(f"llama-cli binary not found at: {exe}")
+
+    if not model.exists():
+        raise FileNotFoundError(f"llama model not found at: {model}")
+
+    # Build command (adjust flags to your llama-cli flavor if different)
+    cmd = [
+        str(exe),
+        "-m", str(model),
+        "-p", prompt_text,
+        "-n", str(n_predict),
+        "-t", str(threads),
+        "--temp", str(temperature),
+        # (keep top-k/top-p or other flags out so you can control externally)
+    ]
+
+    # start sampling and call subprocess
+    sampler.start()
+    t_before = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+        t_after = time.time()
+    except subprocess.TimeoutExpired as e:
+        t_after = time.time()
+        sampler.stop()
+        # return partial info
+        result.update({
+            "generated": "",
+            "model_reply_time": t_after - t_before,
+            "model_inference_time": None,
+            "tokens": 0,
+            "raw_stdout": getattr(e, "stdout", None) or "",
+            "raw_stderr": getattr(e, "stderr", None) or "TIMEOUT",
+        })
+        return result
+
+    sampler.stop()
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    raw_combined = stdout + ("\n" + stderr if stderr else "")
+    result["raw_stdout"] = stdout
+    result["raw_stderr"] = stderr
+
+    # wall-clock subprocess time:
+    model_reply_time = t_after - t_before
+    result["model_reply_time"] = model_reply_time
+
+    # Heuristic: if CLI echoes the prompt, remove the prompt from output to isolate generation
+    generated = stdout
+    if prompt_text and prompt_text.strip() and prompt_text.strip() in stdout:
+        parts = stdout.split(prompt_text.strip())
+        if len(parts) > 1:
+            generated = parts[-1].strip()
+
+    # Fallback: if stdout empty but stderr holds text
+    if not generated and stderr:
+        generated = stderr.strip()
+
+    result["generated"] = generated
+    result["tokens"] = len(generated.split())
+
+    # Attempt to parse model-reported inference timings, e.g. lines like "inference time: 123.45 ms"
+    # This is best-effort: look for numbers followed by 'ms' or 's' near keywords.
+    inference_time = None
+    # common patterns: "inference time: 123.4 ms", "total time: 1.23s", "real time: 0.123s"
+    patterns = [
+        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"model(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
+        r"([0-9]*\.?[0-9]+)\s*ms\b",
+        r"([0-9]*\.?[0-9]+)\s*s\b",
+    ]
+    for pat in patterns:
+        for match in re.finditer(pat, raw_combined, flags=re.IGNORECASE):
+            num = match.group(1)
+            unit = match.group(2) if match.lastindex and match.lastindex >= 2 else None
+            try:
+                val = float(num)
+                if unit and unit.lower().startswith("ms"):
+                    val = val / 1000.0
+                # prefer a small positive non-zero inference_time
+                if val > 0:
+                    inference_time = val
+                    break
+            except Exception:
+                continue
+        if inference_time is not None:
+            break
+
+    # If we didn't find a specific model-reported time, keep None (so caller can differentiate)
+    result["model_inference_time"] = inference_time
+
+    # Resource summary
+    result["resource"] = sampler.summary()
+
+    # Optionally run TTS and measure
+    if tts_after:
+        tts_elapsed = speak_text_timed(result["generated"], cmd=tts_cmd)
+        result["tts_time"] = tts_elapsed
+
+    return result
 
 def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
@@ -217,9 +472,35 @@ def generate_response_ollama(user_text, timeout=30):
                 return data[key].strip()
     return json.dumps(data)[:1000]
 
+def format_bytes(n):
+    # small helper (exists earlier in previous code, but include here if not)
+    for unit in ("B","KB","MB","GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}TB"
+
 def main():
+    """
+    Flow:
+      - record audio -> recorded.wav
+      - transcribe (measure stt_elapsed)
+      - call llama110(...) (sampler passed in) -> model timing + resource summary
+      - TTS (measure tts_elapsed)
+      - print bench summary and return result dict
+    """
+    total_start = time.time()
+
+    # record audio
     wav = record_wav()
+    if not wav:
+        print("[MAIN] Recording failed.")
+        return
+
+    # Transcribe and measure STT time
+    stt_start = time.time()
     transcribed = transcribe_audio(wav)
+    stt_elapsed = time.time() - stt_start
     if not transcribed:
         print("[MAIN] No transcription found.")
         speak_text("Sorry, I did not hear anything.")
@@ -227,19 +508,78 @@ def main():
 
     print("[MAIN] Final transcription to send to model:", repr(transcribed))
 
-    # Try local llama first
-    generated, elapsed, tokens = generate_response_local_llama(transcribed, n_predict=128, threads=4, temperature=0.8)
-    if generated is None:
-        # fallback to Ollama cloud/other host
-        print("error with generating response")
+    # Prepare resource sampler and call llama110
+    sampler = ResourceSampler(interval=0.05)
+
+    # NOTE: pass an explicit model_path so your existing LOCAL_MODEL remains untouched.
+    # Change this path only if your llama2 model is stored elsewhere.
+    llama2_model_path = str(Path.home() / "Downloads" / "llama2.c-stories110M-pruned50.Q3_K_M.gguf")
+
+    try:
+        res = llama110(
+            prompt_text=transcribed,
+            llama_cli_path=LLAMA_CLI,        # reuse your LLAMA_CLI global
+            model_path=llama2_model_path,    # explicit llama110 model (doesn't alter LOCAL_MODEL)
+            n_predict=128,
+            threads=4,
+            temperature=0.5,
+            sampler=sampler,
+            tts_after=False,                 # measure TTS separately below
+            tts_cmd=None,
+            timeout_seconds=180
+        )
+    except FileNotFoundError as e:
+        print("[MAIN] Error launching llama110:", e)
         return
 
-    
-    print("[MAIN] Model replied (local):", generated)
-    if elapsed is not None:
-        approx_tps = (tokens / elapsed) if elapsed and tokens else 0.0
-        print(f"[BENCH] elapsed={elapsed:.3f}s tokens={tokens} approx_TPS={approx_tps:.2f}")
-    speak_text(generated)
+    # If you instead want to prefer generate_response_local_llama (your existing model),
+    # you can call that here and merge timings. But since you asked for llama110, we used it.
+
+    # TTS (measure separately)
+    tts_elapsed = 0.0
+    if res.get("generated"):
+        tts_elapsed = speak_text_timed(res["generated"], cmd=None)
+
+    total_elapsed = time.time() - total_start
+
+    # Build combined summary
+    summary = {
+        "stt_time": round(stt_elapsed, 4),
+        "model_reply_time": round(res.get("model_reply_time") or 0.0, 4),
+        "model_inference_time": None if res.get("model_inference_time") is None else round(res.get("model_inference_time"), 4),
+        "tokens": int(res.get("tokens") or 0),
+        "tts_time": round(tts_elapsed, 4),
+        "total_time": round(total_elapsed, 4),
+        "resource": res.get("resource", {}),
+    }
+
+    # Nicely print the bench
+    print("\n--- BENCH SUMMARY ---")
+    print(f"STT (transcription) time  : {summary['stt_time']:.3f} s")
+    print(f"Model reply time (wall)   : {summary['model_reply_time']:.3f} s")
+    if summary["model_inference_time"] is not None:
+        print(f"Model inference time (parsed): {summary['model_inference_time']:.3f} s")
+    else:
+        print("Model inference time (parsed): N/A")
+    print(f"Tokens produced           : {summary['tokens']}")
+    print(f"TTS time                  : {summary['tts_time']:.3f} s")
+    print(f"Total end-to-end time     : {summary['total_time']:.3f} s")
+
+    # resource summary
+    r = summary["resource"]
+    if isinstance(r, dict):
+        peak = r.get("peak_rss", 0)
+        avg = int(r.get("avg_rss", 0))
+        print("\nResource usage while running:")
+        print(f"Peak RSS: {format_bytes(peak)}, Avg RSS: {format_bytes(avg)}")
+        print(f"Peak CPU%: {r.get('peak_cpu', 0.0):.1f}%, Avg CPU%: {r.get('avg_cpu', 0.0):.1f}% (samples={r.get('samples',0)})")
+    else:
+        print("No resource summary available.")
+
+    print("----------------------\n")
+    # return the raw res + summary for programmatic use
+    return {"res": res, "summary": summary}
+
 
 if __name__ == "__main__":
     main()
