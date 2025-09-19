@@ -7,6 +7,9 @@ from pathlib import Path
 import numpy as np
 import wave
 import io 
+from kittentts import KittenTTS
+import soundfile as sf
+
 def speak_text_espeak(text: str) -> None:
     
     text = (text or "").strip()
@@ -23,6 +26,38 @@ def speak_text_espeak(text: str) -> None:
 # Base path (no extension, Piper will append .onnx and .onnx.json)
 model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
 
+def speak_text_kitten(text: str,
+                      voice: str = "expr-voice-2-f",
+                      speed: float = 1.0):
+    """
+    Use KittenTTS package to synthesize text and play via PulseAudio/Bluetooth speaker.
+    Returns the path of output wav and sample rate.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None, None
+
+    print("[TTS][Kitten] Speak:", text)
+    try:
+        # Initialize model (you can optionally cache this globally)
+        model = KittenTTS()
+
+        # Generate audio
+        audio_data = model.generate(text=text, voice=voice, speed=speed)  # this returns a numpy array
+        sr = model.sample_rate  # usually 24000 Hz with KittenTTS by default according to docs :contentReference[oaicite:3]{index=3}
+
+        # Save to temporary wav file
+        wav_path = "kitten_output.wav"
+        sf.write(wav_path, audio_data, sr, subtype='PCM_16')
+        
+        # Play the wav via PulseAudio
+        subprocess.run(["paplay", wav_path], check=True)
+
+        return wav_path, sr
+
+    except Exception as e:
+        print("[TTS][Kitten] failed:", e)
+        return None, None
 
 
 def speak_text_piper(text: str, model_path="/home/kushal/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx"):
@@ -87,7 +122,7 @@ def benchmark_tts(tts_func, text: str, engine_name: str):
 
 if __name__ == "__main__":
     input_text = "Hello, How are you"
-    result = benchmark_tts(speak_text_piper, input_text, "piper")
+    result = benchmark_tts(speak_text_kitten, input_text, "kitten")
 
     print("\n=== Benchmark Result ===")
     for k, v in result.items():
