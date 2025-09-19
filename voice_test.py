@@ -646,7 +646,6 @@ def main():
 
     if not transcribed:
         print("[MAIN] No transcription found.")
-        speak_text("Sorry, I did not hear anything.", max_sentences=1)
         return
 
     
@@ -691,21 +690,9 @@ def main():
         
         
     generated = res.get("generated", "")
-    raw_stdout = res.get("raw_stdout", "") or ""
-    raw_stderr = res.get("raw_stderr", "") or ""
     model_reply_time = res.get("model_reply_time", 0.0)
     model_inference_time = res.get("model_inference_time", None)
     tokens = res.get("tokens", 0)
-
-    if not generated:
-        # If we got nothing, print raw logs for debugging
-        print("[MAIN] No generated text detected. Showing raw logs for debugging:")
-        print("--- RAW STDOUT ---")
-        print(raw_stdout[:4000])
-        print("--- RAW STDERR ---")
-        print(raw_stderr[:4000])
-        speak_text("Sorry, I couldn't get a reply from the model.", max_sentences=1)
-        return
 
     
     cleaned = generated
@@ -722,12 +709,9 @@ def main():
     print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
 
     
-    try:
-        tts_time = speak_text_timed(cleaned)  
-        # if you prefer sentence-limited safe wrapper: tts_time = speak_text_safe(cleaned, max_sentences=1)
-    except Exception:
-        # fallback to safe speak if speak_text_timed not available
-        tts_time = speak_text(cleaned, max_sentences=1)
+    
+    tts_time = speak_text_timed(cleaned)  
+        
 
     total_elapsed = time.time() - total_start
     stats = res.get("resource", {})
