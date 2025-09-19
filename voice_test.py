@@ -506,7 +506,9 @@ def _run_qwen_llama_cpp(
             cmd,
             capture_output=True,
             text=True,
+
             timeout=120 + n_predict * timeout_scale,
+
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
