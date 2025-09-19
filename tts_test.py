@@ -20,9 +20,10 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx")
+# Base path (no extension, Piper will append .onnx and .onnx.json)
+model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium"
 
-def speak_text_piper(text: str, model_path=str(model_path)):
+def speak_text_piper(text: str, model_path=str(model_base)):
     """
     Speak text using Piper TTS engine and play via PulseAudio (BT speakers).
     Converts Piper's raw PCM into a valid WAV.
@@ -37,7 +38,7 @@ def speak_text_piper(text: str, model_path=str(model_path)):
         # Load Piper voice (uses .onnx + .onnx.json together)
         model = piper.PiperVoice.load(model_path)
 
-        # Capture raw PCM output into memory buffer
+        # Capture raw PCM output
         buffer = io.BytesIO()
         model.synthesize(text, buffer)
 
@@ -47,24 +48,27 @@ def speak_text_piper(text: str, model_path=str(model_path)):
         print("[TTS] Piper generated samples:", len(samples))
 
         if len(samples) == 0:
-            print("[TTS] Warning: Piper returned no audio. Check that both .onnx and .onnx.json exist.")
+            print("[TTS] Warning: Piper returned no audio. Check if JSON matches ONNX.")
             return
 
         # Try to get real sample rate from model (fallback to 22050 Hz)
         rate = getattr(model, "sample_rate", 22050)
 
-        # Save as proper WAV
+        # Save as valid WAV
         with wave.open("piper_output.wav", "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(rate)
             wf.writeframes(samples.tobytes())
 
-        # Play via PulseAudio (Bluetooth)
+        # Play through PulseAudio (Bluetooth)
         subprocess.run(["paplay", "piper_output.wav"], check=True)
 
     except Exception as e:
         print("[TTS] Piper failed:", e)
+
+
+
 def benchmark_tts(tts_func, text: str, engine_name: str):
     """
     Benchmark a TTS function: measures response time and resource usage.
