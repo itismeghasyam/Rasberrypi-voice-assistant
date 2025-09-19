@@ -414,7 +414,15 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     print("[LLM] Running local llama:", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+        # ensure llama.cpp does not try to switch into interactive mode by
+        # providing an explicit non-tty stdin.
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120 + n_predict * 3,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
         print("[LLM] Local llama generation timed out")
         return None, None, None
@@ -470,7 +478,15 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
     print("[LLM] Running Qwen (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 12)
+        # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
+        # exits once generation is finished instead of waiting for extra input.
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120 + n_predict * 12,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
         print("[LLM] Qwen generation timed out")
         return None, None, None
