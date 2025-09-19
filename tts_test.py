@@ -65,59 +65,41 @@ def speak_text_kitten(text: str, voice: str = "expr-voice-2-f", speed: float = 1
 
 
 def speak_text_nix(text: str, model_dir: str = model_nix):
-    """
-    Nix-TTS: tokenize expects list[str]. Plays via PulseAudio (Bluetooth).
-    Returns (wav_path, sample_rate) on success, else (None, None).
-    """
     text = (text or "").strip()
     if not text:
         return None, None
-
     print("[TTS][Nix] Speak:", text)
     try:
         nix = NixTTSInference(model_dir=model_dir)
 
-        # IMPORTANT: pass a batch (list[str]) to tokenize
-        c, c_len, _ = nix.tokenize([text])   # batch size = 1
+        # IMPORTANT: pass a STRING (README shows this)
+        c, c_len, _ = nix.tokenize(text)
 
         # Synthesize
-        xw = nix.vocalize(c, c_len)          # waveform batch
+        xw = nix.vocalize(c, c_len)  # returns waveform batch
 
-        # Handle possible shapes: (T), (B,T), or (B,C,T)
+        # Handle shapes: (T), (B,T) or (B,C,T)
         if not isinstance(xw, np.ndarray) or xw.size == 0:
-            print("[TTS][Nix] Warning: empty waveform")
-            return None, None
-        if xw.ndim == 1:
-            wav = xw
-        elif xw.ndim == 2:
-            wav = xw[0]
-        elif xw.ndim == 3:
-            wav = xw[0, 0]
-        else:
-            print(f"[TTS][Nix] Unexpected waveform shape: {xw.shape}")
-            return None, None
+            print("[TTS][Nix] Warning: empty waveform"); return None, None
+        wav = xw if xw.ndim == 1 else (xw[0] if xw.ndim == 2 else xw[0, 0])
 
-        # Nix-TTS default sample rate
+        # Nix-TTS sample rate (per README)
         sr = 22050
 
-        # Convert float [-1,1] → int16 PCM
-        wav = np.clip(wav, -1.0, 1.0)
-        pcm16 = (wav * 32767).astype(np.int16)
-
+        # Float [-1,1] → int16 WAV
+        pcm16 = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16)
         out_path = "nix_output.wav"
         with wave.open(out_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sr)
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
             wf.writeframes(pcm16.tobytes())
 
+        # Route via PulseAudio (your BT default)
         subprocess.run(["paplay", out_path], check=True)
         return out_path, sr
 
     except Exception as e:
         print("[TTS][Nix] failed:", e)
         return None, None
-
 def speak_text_piper(text: str, model_path="/home/kushal/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx"):
     """
     Use Piper CLI to synthesize text and stream audio to aplay.
