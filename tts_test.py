@@ -26,31 +26,31 @@ def speak_text_espeak(text: str) -> None:
 # Base path (no extension, Piper will append .onnx and .onnx.json)
 model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
 
-def speak_text_kitten(text: str,
-                      voice: str = "expr-voice-2-f",
-                      speed: float = 1.0):
+def speak_text_kitten(text: str, voice: str = "expr-voice-2-f", speed: float = 1.0):
     """
-    Use KittenTTS package to synthesize text and play via PulseAudio/Bluetooth speaker.
-    Returns the path of output wav and sample rate.
+    Use KittenTTS to synthesize text and play via PulseAudio/Bluetooth speaker.
     """
     text = (text or "").strip()
     if not text:
         return None, None
 
     print("[TTS][Kitten] Speak:", text)
+
     try:
-        # Initialize model (you can optionally cache this globally)
+        # Initialize model (downloaded automatically on first run)
         model = KittenTTS()
 
-        # Generate audio
-        audio_data = model.generate(text=text, voice=voice, speed=speed)  # this returns a numpy array
-        sr = model.sample_rate  # usually 24000 Hz with KittenTTS by default according to docs :contentReference[oaicite:3]{index=3}
+        # Generate audio (numpy array)
+        audio_data = model.generate(text=text, voice=voice, speed=speed)
 
-        # Save to temporary wav file
+        # KittenTTS uses fixed 24000 Hz
+        sr = 24000
+
+        # Save as WAV
         wav_path = "kitten_output.wav"
-        sf.write(wav_path, audio_data, sr, subtype='PCM_16')
-        
-        # Play the wav via PulseAudio
+        sf.write(wav_path, audio_data, sr, subtype="PCM_16")
+
+        # Play through PulseAudio (Bluetooth)
         subprocess.run(["paplay", wav_path], check=True)
 
         return wav_path, sr
@@ -58,7 +58,6 @@ def speak_text_kitten(text: str,
     except Exception as e:
         print("[TTS][Kitten] failed:", e)
         return None, None
-
 
 def speak_text_piper(text: str, model_path="/home/kushal/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx"):
     """
