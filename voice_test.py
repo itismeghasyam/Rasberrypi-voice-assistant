@@ -291,7 +291,8 @@ def llama110(prompt_text: str,
         "-n", str(n_predict),
         "-t", str(threads),
         "--temp", str(temperature),
-        # (keep top-k/top-p or other flags out so you can control externally)
+        "-no-cnv",       
+        "--single-turn",
     ]
 
     # start sampling and call subprocess
