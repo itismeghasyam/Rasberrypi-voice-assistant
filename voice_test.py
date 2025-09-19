@@ -685,7 +685,7 @@ def main():
         sampler=sampler,
         instruct_prefix="Answer in one short sentence.",  
         tts_after=False,
-        timeout_seconds=120)
+        timeout_seconds=250)
 
         
         
