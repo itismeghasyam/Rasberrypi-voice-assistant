@@ -165,7 +165,7 @@ def _guess_lang_from_path(model_dir: str) -> str:
             return code
     return "unk"
 
-def benchmark_once_vosk(audio_path, model_dir):
+def benchmark_once_vosk(audio_path, model_dir= str(Path.home() / "models" / "vosk-model-small-en-us-0.15")):
     print(f"\n===== Benchmark (VOSK): model_dir='{model_dir}' =====")
     proc = psutil.Process()
     cpu_before = proc.cpu_times()
@@ -279,13 +279,10 @@ def main():
                 results.append(res)
 
     else:  # Vosk
-        if not args.vosk_model_dir:
-            print("ERROR: --vosk-model-dir is required for --engine vosk")
-            return
         for i in range(args.repeat):
             if args.repeat > 1:
                 print(f"\n--- Run {i+1}/{args.repeat} for Vosk ---")
-            res = benchmark_once_vosk(str(RECORDED_WAV), args.vosk_model_dir)
+            res = benchmark_once_vosk(str(RECORDED_WAV), model_dir=str(Path.home() / "models" / "vosk-model-small-en-us-0.15"))
             res["record_time_s"] = record_time
             res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
             results.append(res)
