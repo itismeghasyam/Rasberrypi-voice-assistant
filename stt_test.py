@@ -173,7 +173,7 @@ def main():
                 print(f"\n--- Run {i+1}/{args.repeat} for model {m} ---")
             results.append(benchmark_once(str(RECORDED_WAV), m, language=args.language))
 
-    print_summary(results)
+    print_summary(results, include_record=getattr(args, "include_record", False))
 
 if __name__ == "__main__":
     main()
