@@ -483,102 +483,119 @@ def format_bytes(n):
 def main():
     """
     Flow:
-      - record audio -> recorded.wav
-      - transcribe (measure stt_elapsed)
-      - call llama110(...) (sampler passed in) -> model timing + resource summary
-      - TTS (measure tts_elapsed)
-      - print bench summary and return result dict
+      1. record audio
+      2. transcribe (stt_elapsed)
+      3. call llama110 (explicit llama2 model path) with a short-answer instruction
+      4. print/return results
+      5. TTS only the first sentence
     """
     total_start = time.time()
 
-    # record audio
+    # 1) record
     wav = record_wav()
     if not wav:
         print("[MAIN] Recording failed.")
         return
 
-    # Transcribe and measure STT time
+    # 2) STT
     stt_start = time.time()
     transcribed = transcribe_audio(wav)
     stt_elapsed = time.time() - stt_start
+    print(f"[MAIN] Transcription (STT time {stt_elapsed:.3f}s): {repr(transcribed)}")
+
     if not transcribed:
         print("[MAIN] No transcription found.")
-        speak_text("Sorry, I did not hear anything.")
+        speak_text("Sorry, I did not hear anything.", max_sentences=1)
         return
 
-    print("[MAIN] Final transcription to send to model:", repr(transcribed))
+    # 3) Prepare prompt: ask the model explicitly for a short answer
+    # This PREVENTS long rambling answers for simple questions like "What is your name?"
+    short_prefix = "Answer in one short sentence. "
+    prompt_to_model = short_prefix + transcribed.strip()
 
-    # Prepare resource sampler and call llama110
+    # 4) Call llama110 (uses llama2 model); pass a sampler to collect resources
     sampler = ResourceSampler(interval=0.05)
-
-    # NOTE: pass an explicit model_path so your existing LOCAL_MODEL remains untouched.
-    # Change this path only if your llama2 model is stored elsewhere.
     llama2_model_path = str(Path.home() / "Downloads" / "llama2.c-stories110M-pruned50.Q3_K_M.gguf")
-
     try:
         res = llama110(
-            prompt_text=transcribed,
-            llama_cli_path=LLAMA_CLI,        # reuse your LLAMA_CLI global
-            model_path=llama2_model_path,    # explicit llama110 model (doesn't alter LOCAL_MODEL)
-            n_predict=128,
+            prompt_text=prompt_to_model,
+            llama_cli_path=LLAMA_CLI,
+            model_path=llama2_model_path,
+            n_predict=64,        # limit generation length
             threads=4,
-            temperature=0.5,
+            temperature=0.1,     # low temp to prefer concise answers
             sampler=sampler,
-            tts_after=False,                 # measure TTS separately below
-            tts_cmd=None,
-            timeout_seconds=180
+            tts_after=False,
+            timeout_seconds=90
         )
     except FileNotFoundError as e:
         print("[MAIN] Error launching llama110:", e)
         return
 
-    # If you instead want to prefer generate_response_local_llama (your existing model),
-    # you can call that here and merge timings. But since you asked for llama110, we used it.
+    # 5) Inspect result and fallback behavior
+    generated = res.get("generated", "")
+    raw_stdout = res.get("raw_stdout", "") or ""
+    raw_stderr = res.get("raw_stderr", "") or ""
+    model_reply_time = res.get("model_reply_time", 0.0)
+    model_inference_time = res.get("model_inference_time", None)
+    tokens = res.get("tokens", 0)
 
-    # TTS (measure separately)
-    tts_elapsed = 0.0
-    if res.get("generated"):
-        tts_elapsed = speak_text_timed(res["generated"], cmd=None)
+    if not generated:
+        # If we got nothing, print raw logs for debugging
+        print("[MAIN] No generated text detected. Showing raw logs for debugging:")
+        print("--- RAW STDOUT ---")
+        print(raw_stdout[:4000])
+        print("--- RAW STDERR ---")
+        print(raw_stderr[:4000])
+        speak_text("Sorry, I couldn't get a reply from the model.", max_sentences=1)
+        return
+
+    # 6) Clean generated: remove any remaining prompt echo or control garbage
+    cleaned = generated
+    if prompt_to_model.strip() and prompt_to_model.strip() in cleaned:
+        # remove the prompt echo if present
+        cleaned = cleaned.split(prompt_to_model.strip(), 1)[-1].strip()
+
+    # trim trailing diagnostic lines if accidentally included
+    cleaned_lines = [ln for ln in cleaned.splitlines() if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace"))]
+    cleaned = "\n".join(cleaned_lines).strip()
+
+    # 7) Print model reply to console (safe truncated printing)
+    print("\n[MAIN] Model reply (cleaned):")
+    print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
+
+    # 8) Speak only the first sentence so it doesn't read long replies
+    # Use speak_text_safe or speak_text_timed depending on which you have
+    try:
+        tts_time = speak_text_timed(cleaned)  # your timed TTS wrapper
+        # if you prefer sentence-limited safe wrapper: tts_time = speak_text_safe(cleaned, max_sentences=1)
+    except Exception:
+        # fallback to safe speak if speak_text_timed not available
+        tts_time = speak_text(cleaned, max_sentences=1)
 
     total_elapsed = time.time() - total_start
+    stats = res.get("resource", {})
 
-    # Build combined summary
-    summary = {
-        "stt_time": round(stt_elapsed, 4),
-        "model_reply_time": round(res.get("model_reply_time") or 0.0, 4),
-        "model_inference_time": None if res.get("model_inference_time") is None else round(res.get("model_inference_time"), 4),
-        "tokens": int(res.get("tokens") or 0),
-        "tts_time": round(tts_elapsed, 4),
-        "total_time": round(total_elapsed, 4),
-        "resource": res.get("resource", {}),
-    }
-
-    # Nicely print the bench
+    # 9) Print bench summary
     print("\n--- BENCH SUMMARY ---")
-    print(f"STT (transcription) time  : {summary['stt_time']:.3f} s")
-    print(f"Model reply time (wall)   : {summary['model_reply_time']:.3f} s")
-    if summary["model_inference_time"] is not None:
-        print(f"Model inference time (parsed): {summary['model_inference_time']:.3f} s")
+    print(f"STT time: {stt_elapsed:.3f}s")
+    print(f"Model reply time (wall): {model_reply_time:.3f}s")
+    if model_inference_time is not None:
+        print(f"Model inference time (parsed): {model_inference_time:.3f}s")
     else:
         print("Model inference time (parsed): N/A")
-    print(f"Tokens produced           : {summary['tokens']}")
-    print(f"TTS time                  : {summary['tts_time']:.3f} s")
-    print(f"Total end-to-end time     : {summary['total_time']:.3f} s")
-
-    # resource summary
-    r = summary["resource"]
-    if isinstance(r, dict):
-        peak = r.get("peak_rss", 0)
-        avg = int(r.get("avg_rss", 0))
-        print("\nResource usage while running:")
+    print(f"Tokens produced: {tokens}")
+    print(f"TTS time: {tts_time:.3f}s")
+    print(f"Total end-to-end: {total_elapsed:.3f}s")
+    if isinstance(stats, dict):
+        peak = stats.get("peak_rss", 0)
+        avg = int(stats.get("avg_rss", 0))
         print(f"Peak RSS: {format_bytes(peak)}, Avg RSS: {format_bytes(avg)}")
-        print(f"Peak CPU%: {r.get('peak_cpu', 0.0):.1f}%, Avg CPU%: {r.get('avg_cpu', 0.0):.1f}% (samples={r.get('samples',0)})")
-    else:
-        print("No resource summary available.")
-
+        print(f"Peak CPU%: {stats.get('peak_cpu',0.0):.1f}%, Avg CPU%: {stats.get('avg_cpu',0.0):.1f}% (samples={stats.get('samples',0)})")
     print("----------------------\n")
-    # return the raw res + summary for programmatic use
-    return {"res": res, "summary": summary}
+
+    # 10) return full result for programmatic use
+    return {"transcription": transcribed, "cleaned": cleaned, "res": res, "bench_total": total_elapsed}
 
 
 if __name__ == "__main__":
