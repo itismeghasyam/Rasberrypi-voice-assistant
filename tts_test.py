@@ -3,7 +3,7 @@ import time
 import psutil
 import os
 import piper
-
+from pathlib import Path
 def speak_text_espeak(text: str) -> None:
     
     text = (text or "").strip()
@@ -17,11 +17,8 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-def speak_text_piper(text: str, model_path="voices/en_US-amy-medium.onnx"):
-    """
-    Speak text using Piper TTS engine.
-    Requires a downloaded ONNX voice model.
-    """
+def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-assistant" / "models"/ "gpt2.Q3_K_M.gguf")):
+  
     text = (text or "").strip()
     if not text:
         return
