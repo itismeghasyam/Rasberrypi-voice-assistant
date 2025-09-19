@@ -30,7 +30,11 @@ OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
 OLLAMA_MODEL = "mistral"
 
 # Qwen (local, via llama.cpp)
-QWEN_MODEL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+QWEN_MODEL_SMALL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+QWEN_MODEL_LARGE = str(Path.home() / "Downloads" / "qwen2.5-1.5b-instruct-q3_k_m.gguf")
+# Maintain backwards compatibility with older references expecting QWEN_MODEL
+QWEN_MODEL = QWEN_MODEL_SMALL
+# Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
 
 
 _tts_engine = None
@@ -452,15 +456,33 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
     return generated, elapsed, tokens
 
-def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
+def _run_qwen_llama_cpp(
+    model_path,
+    user_text,
+    *,
+    n_predict,
+    threads,
+    temperature,
+    extra_cli=None,
+    timeout_scale=12,
+    label="Qwen",
+):
     """
-    Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
-    Uses the same contract as generate_response_local_llama.
+    Shared helper to invoke llama.cpp with a given Qwen model and common hygiene.
+    Returns (generated_text, elapsed_seconds, token_estimate) just like the
+    legacy wrappers.
     """
     exe = Path(LLAMA_CLI)
-    model = Path(QWEN_MODEL)
+    model = Path(model_path)
 
-    prompt_escaped = user_text
+    if not exe.exists():
+        print(f"[LLM] llama-cli binary not found: {exe}")
+        return None, None, None
+
+    if not model.exists():
+        print(f"[LLM] {label} model not found: {model}")
+        return None, None, None
+
     cmd = [
         str(exe),
         "-m", str(model),
@@ -470,12 +492,12 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
         "--temp", str(temperature),
         "--top-p", "0.2",
         "--top-k", "40",
-        "--simple-io",        # ensure pure non-interactive IO
-        "-ngl", "0",          # explicit: no GPU offload on Pi
-        "--ctx-size", "512",  # small context is enough here
     ]
 
-    print("[LLM] Running Qwen (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
+    if extra_cli:
+        cmd.extend(extra_cli)
+
+    print(f"[LLM] Running {label} (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
     start = time.time()
     try:
         # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
@@ -484,11 +506,13 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
             cmd,
             capture_output=True,
             text=True,
-            timeout=120 + n_predict * 12,
+
+            timeout=120 + n_predict * timeout_scale,
+
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        print("[LLM] Qwen generation timed out")
+        print(f"[LLM] {label} generation timed out")
         return None, None, None
 
     elapsed = time.time() - start
@@ -510,9 +534,101 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
 
     tokens = len(generated.split())
     tps = tokens / elapsed if elapsed > 0 else 0.0
-    print(f"[LLM] Qwen generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
+    print(f"[LLM] {label} generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
     return generated, elapsed, tokens
 
+
+def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
+    """
+    Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
+    Uses the same contract as generate_response_local_llama.
+    """
+    return _run_qwen_llama_cpp(
+        QWEN_MODEL,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",        # ensure pure non-interactive IO
+            "-ngl", "0",          # explicit: no GPU offload on Pi
+            "--ctx-size", "512",  # small context is enough here
+        ],
+        timeout_scale=12,
+        label="Qwen 0.5B",
+    )
+
+
+def generate_response_qwen_large(user_text, n_predict=48, threads=4, temperature=0.2):
+    """
+    Run Qwen2.5 1.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
+    Slightly longer default generation to take advantage of the larger model.
+    """
+    return _run_qwen_llama_cpp(
+        QWEN_MODEL_LARGE,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+            "--ctx-size", "1024",
+        ],
+        timeout_scale=16,
+        label="Qwen 1.5B",
+    )
+
+
+
+def select_qwen_generator(preference=None):
+    """
+    Return a tuple (callable, label) for the preferred Qwen variant.
+    `preference` can be values like "0.5b", "small", "1.5b", "large", or "auto".
+    If the requested model file is missing we fall back to an available one and
+    emit a short console notice.
+    """
+    pref_raw = preference if preference is not None else os.environ.get("QWEN_MODEL_VARIANT", "")
+    pref = (pref_raw or "").strip().lower()
+
+    large_exists = Path(QWEN_MODEL_LARGE).exists()
+    small_exists = Path(QWEN_MODEL).exists()
+
+    large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
+    small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
+
+    if pref in large_alias:
+        if large_exists:
+            return generate_response_qwen_large, "Qwen 1.5B"
+        print(f"[MAIN] Preferred Qwen variant '{pref_raw}' not found at {QWEN_MODEL_LARGE}. Falling back to smaller model.")
+        pref = "fallback-small"
+
+    if pref in small_alias or not pref:
+        if small_exists:
+            return generate_response_qwen, "Qwen 0.5B"
+        if pref:
+            print(f"[MAIN] Preferred Qwen variant '{pref_raw}' not available at {QWEN_MODEL}.")
+        if large_exists:
+            print("[MAIN] Using Qwen 1.5B instead.")
+            return generate_response_qwen_large, "Qwen 1.5B"
+
+    if pref == "auto":
+        if large_exists:
+            return generate_response_qwen_large, "Qwen 1.5B"
+        if small_exists:
+            return generate_response_qwen, "Qwen 0.5B"
+
+    if pref not in (large_alias | small_alias | {"auto", "fallback-small"}) and pref:
+        print(f"[MAIN] Unknown Qwen variant '{pref_raw}'. Valid options: 0.5B/small, 1.5B/large, auto.")
+
+    if small_exists:
+        return generate_response_qwen, "Qwen 0.5B"
+    if large_exists:
+        return generate_response_qwen_large, "Qwen 1.5B"
+
+    # If neither file is present we default to the small path so downstream
+    # errors point at the expected location.
+    return generate_response_qwen, "Qwen 0.5B"
 
 
 def generate_response_ollama(user_text, timeout=30):
@@ -577,8 +693,14 @@ def main():
         print("[MAIN] Missing generate_response_qwen(...). Add the Qwen wrapper first.")
         return
 
-    out_text, model_reply_time, _tok_est = generate_response_qwen(
-        prompt_to_model, n_predict=32, threads=4, temperature=0.2
+    qwen_pref = os.environ.get("QWEN_MODEL_VARIANT")
+    generator, qwen_label = select_qwen_generator(qwen_pref)
+    print(f"[MAIN] Using Qwen variant: {qwen_label}")
+
+    out_text, model_reply_time, _tok_est = generator(
+        prompt_to_model,
+        threads=4,
+        temperature=0.2,
     )
     if out_text is None:
         print("[MAIN] Qwen did not return output.")
