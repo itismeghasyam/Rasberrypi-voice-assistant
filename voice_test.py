@@ -29,6 +29,8 @@ LOCAL_MODEL = str(Path.home() / "models" / "gpt2.Q3_K_M.gguf")
 OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
 OLLAMA_MODEL = "mistral"
 
+# Qwen (local, via llama.cpp)
+QWEN_MODEL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
 
 
 _tts_engine = None
@@ -138,10 +140,8 @@ import re
 import os
 from pathlib import Path
 
-try:
-    import psutil
-except Exception:
-    psutil = None  # ResourceSampler will be a no-op if psutil isn't installed
+
+import psutil
 
 # -------------------------
 # Resource sampler (optional)
@@ -385,58 +385,6 @@ def llama110(prompt_text: str,
     return result
 
 
-
-
-def run_qwen_once(prompt: str,
-                  llama_cli: str = None,
-                  model_path: str = None,
-                  n_predict: int = 32,
-                  threads: int = 2,
-                  temp: float = 0.0,
-                  timeout: int = 600):
-    """
-    Run the Qwen gguf non-interactively and return dict:
-      { stdout, stderr, elapsed, timed_out, rc }
-    """
-    if llama_cli is None:
-        llama_cli = str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
-    if model_path is None:
-        model_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
-
-        cmd = [
-        str(exe),
-        "-m", str(model),
-        "-p", prompt,
-        "-n", str(n_predict),
-        "-t", str(threads),
-        "--temp", str(temp),
-        "--simple-io",     # prints only the generation (no extra prompts)
-        # Optional: uncomment if your build supports it and you want templating
-        # "--instruct",
-        ]
-
-
-    start = time.time()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        elapsed = time.time() - start
-        timed_out = False
-    except subprocess.TimeoutExpired as e:
-        elapsed = time.time() - start
-        stdout = (e.stdout or "") if hasattr(e, "stdout") else ""
-        stderr = (e.stderr or "TIMEOUT") if hasattr(e, "stderr") else "TIMEOUT"
-        return {"stdout": stdout, "stderr": stderr, "elapsed": elapsed, "timed_out": True, "rc": None}
-
-    return {
-        "stdout": (proc.stdout or "").strip(),
-        "stderr": (proc.stderr or "").strip(),
-        "elapsed": elapsed,
-        "timed_out": False,
-        "rc": proc.returncode
-    }
-
-
-
 def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
@@ -496,6 +444,69 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
     return generated, elapsed, tokens
 
+def generate_response_qwen(user_text, n_predict=128, threads=4, temperature=0.2):
+    """
+    Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
+    Uses the same contract as generate_response_local_llama.
+    """
+    exe = Path(LLAMA_CLI)
+    model = Path(QWEN_MODEL)
+
+    if not exe.exists() or not model.exists():
+        missing = []
+        if not exe.exists():
+            missing.append("llama-cli")
+        if not model.exists():
+            missing.append("Qwen model")
+        print("[LLM] Qwen not available (missing {}).".format(", ".join(missing)))
+        return None, None, None
+
+    prompt_escaped = user_text
+    cmd = [
+        str(exe),
+        "-m", str(model),
+        "-p", prompt_escaped,
+        "-n", str(n_predict),
+        "-t", str(threads),
+        "--temp", str(temperature),
+        "--top-p", "0.2",
+        "--top-k", "40",
+        # NOTE: for simple single-turn Q&A, no chat template args needed.
+        # If you later want conversation formatting, you can explore --ctx-size, --repeat-penalty, etc.
+    ]
+
+    print("[LLM] Running Qwen (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
+    start = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+    except subprocess.TimeoutExpired:
+        print("[LLM] Qwen generation timed out")
+        return None, None, None
+
+    elapsed = time.time() - start
+    out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not out:
+        return "", elapsed, 0
+
+    # Strip echoed prompt if present
+    generated = out
+    if user_text.strip() and user_text.strip() in out:
+        parts = out.split(user_text.strip())
+        if len(parts) > 1:
+            generated = parts[-1].strip()
+
+    # Clean common noise and blank lines
+    lines = [l for l in generated.splitlines() if l.strip()]
+    if lines:
+        generated = "\n".join(lines).strip()
+
+    tokens = len(generated.split())
+    tps = tokens / elapsed if elapsed > 0 else 0.0
+    print(f"[LLM] Qwen generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
+    return generated, elapsed, tokens
+
+
+
 def generate_response_ollama(user_text, timeout=30):
     # fallback method if local llama isn't available
     system_prefix = (
@@ -553,46 +564,37 @@ def main():
     short_prefix = "Answer in one short sentence. "
     prompt_to_model = short_prefix + transcribed.strip()
 
-    # --- Qwen (via llama-cli) ---
-    qwen_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
-    res = run_qwen_once(
-        prompt_to_model,
-        llama_cli=LLAMA_CLI,
-        model_path=qwen_path,
-        n_predict=16,
-        threads=2,
-        temp=0.1,
-        timeout=600
+    # --- Qwen (via llama.cpp) ---
+    if not callable(globals().get("generate_response_qwen")):
+        print("[MAIN] Missing generate_response_qwen(...). Add the Qwen wrapper first.")
+        return
+
+    out_text, model_reply_time, _tok_est = generate_response_qwen(
+        prompt_to_model, n_predict=128, threads=4, temperature=0.2
     )
+    if out_text is None:
+        print("[MAIN] Qwen did not return output.")
+        return
 
-    raw_out = (res.get("stdout") or "").strip()
-    raw_err = (res.get("stderr") or "").strip()
-    model_reply_time = float(res.get("elapsed") or 0.0)
-
-    # Prefer stdout; fall back to stderr
-    generated = raw_out if raw_out else raw_err
-
-    # Strip echoed prompt if present
-    if prompt_to_model.strip() and prompt_to_model.strip() in generated:
-        generated = generated.split(prompt_to_model.strip(), 1)[-1].strip()
-
-    # Remove common llama.cpp noise lines
-    cleaned_lines = [
-        ln for ln in generated.splitlines()
-        if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace"))
-    ]
-    cleaned = "\n".join(cleaned_lines).strip()
-
+    # Clean minimal (our wrapper already strips noise/echo)
+    cleaned = out_text.strip()
     tokens = len(cleaned.split())
 
     print("\n[MAIN] Model reply:")
     print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
 
-    tts_time = speak_text_timed(cleaned)
+    # --- TTS ---
+    tts_time = 0.0
+    if callable(globals().get("speak_text_timed")):
+        tts_start = time.time()
+        tts_time = speak_text_timed(cleaned)
+        if tts_time is None:
+            # if speak_text_timed doesn't return duration, compute wall clock
+            tts_time = time.time() - tts_start
 
     total_elapsed = time.time() - total_start
 
-    # Bench summary (resource stats not available for run_qwen_once)
+    # Bench summary
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
     print(f"Model reply time (wall): {model_reply_time:.3f}s")
@@ -607,10 +609,11 @@ def main():
     return {
         "transcription": transcribed,
         "generated": cleaned,
-        "res": res,
-        "bench_total": total_elapsed
+        "bench_total": total_elapsed,
+        "model_time": model_reply_time,
+        "tts_time": tts_time,
+        "engine": "qwen",
     }
-
 
 if __name__ == "__main__":
     main()
