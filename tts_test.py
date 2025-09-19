@@ -4,6 +4,8 @@ import psutil
 import os
 import piper
 from pathlib import Path
+import numpy as np
+import wave
 def speak_text_espeak(text: str) -> None:
     
     text = (text or "").strip()
@@ -17,8 +19,13 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-assistant" / "voices"/ "en_US-amy-medium.onnx")):
-  
+model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx")
+
+def speak_text_piper(text: str, model_path=model_path):
+    """
+    Speak text using Piper TTS engine and play via PulseAudio (BT speakers).
+    Outputs a proper WAV file so paplay can handle it.
+    """
     text = (text or "").strip()
     if not text:
         return
@@ -26,26 +33,27 @@ def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-as
     print("[TTS] Piper Speak:", text)
 
     try:
+        # Load Piper model
         model = piper.PiperVoice.load(model_path)
 
-        # Write synthesized audio
-        with open("piper_output.wav", "wb") as f:
-            model.synthesize(text, f)
-            f.flush()
-            os.fsync(f.fileno())
+        # Generate raw PCM samples (float32)
+        samples = np.array(list(model.synthesize_stream_raw(text)), dtype=np.float32)
 
-        # Ensure PulseAudio accepts format
-        subprocess.run([
-            "ffmpeg", "-y", "-i", "piper_output.wav",
-            "-ar", "22050", "-ac", "1", "piper_fixed.wav"
-        ], check=True)
+        # Convert to 16-bit PCM
+        pcm16 = (samples * 32767).astype(np.int16)
 
-        # Play via PulseAudio (Bluetooth-friendly)
-        subprocess.run(["paplay", "piper_fixed.wav"], check=True)
+        # Save as proper WAV
+        with wave.open("piper_output.wav", "wb") as wf:
+            wf.setnchannels(1)       # mono
+            wf.setsampwidth(2)       # 16-bit
+            wf.setframerate(22050)   # sample rate
+            wf.writeframes(pcm16.tobytes())
+
+        # Play with PulseAudio (Bluetooth)
+        subprocess.run(["paplay", "piper_output.wav"], check=True)
 
     except Exception as e:
         print("[TTS] Piper failed:", e)
-
 
 def benchmark_tts(tts_func, text: str, engine_name: str):
     """
