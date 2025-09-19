@@ -26,16 +26,26 @@ def speak_text_piper(text: str, model_path=str(Path.home()/ "Rasberrypi-voice-as
     print("[TTS] Piper Speak:", text)
 
     try:
-        # Initialize Piper (lazy-load)
         model = piper.PiperVoice.load(model_path)
-        # Stream audio directly (or save to file)
+
+        # Write synthesized audio
         with open("piper_output.wav", "wb") as f:
             model.synthesize(text, f)
+            f.flush()
+            os.fsync(f.fileno())
 
-        # Play audio file
-        subprocess.run(["paplay", "piper_output.wav"], check=True)
+        # Ensure PulseAudio accepts format
+        subprocess.run([
+            "ffmpeg", "-y", "-i", "piper_output.wav",
+            "-ar", "22050", "-ac", "1", "piper_fixed.wav"
+        ], check=True)
+
+        # Play via PulseAudio (Bluetooth-friendly)
+        subprocess.run(["paplay", "piper_fixed.wav"], check=True)
+
     except Exception as e:
         print("[TTS] Piper failed:", e)
+
 
 def benchmark_tts(tts_func, text: str, engine_name: str):
     """
