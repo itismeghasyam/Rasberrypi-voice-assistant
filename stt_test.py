@@ -1,7 +1,8 @@
 import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
+from transformers import pipeline
+import torch
 import time
 import threading
 import argparse
@@ -155,6 +156,60 @@ def benchmark_once_fw(audio_path, model_size, language=None):
         "chars": len(transcript),
     }
 
+# Whisper-distil
+def benchmark_once_distil(audio_path, model_id="distil-whisper/distil-small.en"):
+    print(f"\n===== Benchmark (DISTIL): model='{model_id}' =====")
+    proc = psutil.Process()
+    cpu_before = proc.cpu_times()
+    wall_start = time.time()
+
+    sampler = ResourceSampler(interval=0.15)
+    sampler.start()
+
+    # Load model/pipeline
+    t0 = time.time()
+    # You can limit CPU threads if you want: torch.set_num_threads(4)
+    asr = pipeline(
+        "automatic-speech-recognition",
+        model=model_id,
+        device="cpu"   # Pi = CPU
+        # dtype left default (float32) for CPU stability
+    )
+    load_time = time.time() - t0
+    print(f"[LOAD] Model loaded in {load_time:.2f}s")
+
+    # Transcribe
+    t1 = time.time()
+    out = asr(audio_path)
+    transcribe_time = time.time() - t1
+
+    sampler.stop()
+    wall = time.time() - wall_start
+    cpu_after = proc.cpu_times()
+    user_cpu = cpu_after.user - cpu_before.user
+    sys_cpu  = cpu_after.system - cpu_before.system
+    res = sampler.summary()
+
+    transcript = (out.get("text") or "").strip()
+    detected_language = "en"  # Distil-Whisper is English-only for now
+    print(f"[INFO] Language: {detected_language}")
+    print(f"[TIME] Load: {load_time:.2f}s | Transcribe: {transcribe_time:.2f}s | Total: {wall:.2f}s")
+    print(f"[CPU ] user: {user_cpu:.2f}s | system: {sys_cpu:.2f}s | avg%: {res['cpu_avg']:.1f} | max%: {res['cpu_max']:.1f}")
+    print(f"[MEM ] RSS now: {res['rss_cur_mb']:.1f} MB | Peak (sampled): {res['rss_peak_mb']:.1f} MB")
+    print(f"[TEXT] {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
+
+    return {
+        "model": f"distil:{model_id.split('/')[-1]}",
+        "load_time_s": load_time,
+        "transcribe_time_s": transcribe_time,
+        "total_time_s": wall,
+        "cpu_avg_percent": res["cpu_avg"],
+        "cpu_max_percent": res["cpu_max"],
+        "rss_peak_mb": res["rss_peak_mb"],
+        "detected_language": detected_language,
+        "chars": len(transcript),
+    }
+
 
 # Vosk
 def _guess_lang_from_path(model_dir: str) -> str:
@@ -238,7 +293,7 @@ def benchmark_once_vosk(audio_path, model_dir= str(Path.home() / "models" / "vos
 # CLI 
 def parse_args():
     p = argparse.ArgumentParser(description="STT benchmarks (Faster-Whisper or Vosk)")
-    p.add_argument("--engine", choices=["fw", "vosk"], default="fw",
+    p.add_argument("--engine", choices=["fw", "vosk","distil"], default="fw",
                    help="Engine to benchmark: fw (Faster-Whisper) or vosk")
     p.add_argument("--models", type=str, default="tiny",
                    help="FW: comma-separated models (e.g., tiny or tiny,base). Ignored for Vosk.")
@@ -251,6 +306,8 @@ def parse_args():
                    help="Skip recording and reuse recorded.wav")
     p.add_argument("--include-record", action="store_true",
                    help="Add recording time to the reported e2e total")
+    p.add_argument("--distil-model", type=str, default="distil-whisper/distil-small.en",
+               help="HF model id for Distil-Whisper (English only)")
     return p.parse_args()
 
 
@@ -277,6 +334,13 @@ def main():
                 res["record_time_s"] = record_time
                 res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
                 results.append(res)
+    
+    elif args.engine == "distil":
+        res = benchmark_once_distil(str(RECORDED_WAV), model_id=args.distil_model)
+        res["record_time_s"] = record_time
+        res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
+        results.append(res)
+
 
     else:  # Vosk
         for i in range(args.repeat):
@@ -286,6 +350,8 @@ def main():
             res["record_time_s"] = record_time
             res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
             results.append(res)
+            
+    
 
     print_summary(results, include_record=args.include_record)
 
