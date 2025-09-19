@@ -383,6 +383,153 @@ def llama110(prompt_text: str,
 
     return result
 
+
+def qwen25(prompt_text: str,
+           llama_cli_path: str = None,
+           model_path: str = None,
+           n_predict: int = 16,
+           threads: int = 4,
+           temperature: float = 0.1,
+           sampler: ResourceSampler = None,
+           instruct_prefix: str = "Answer in one short sentence.",
+           tts_after: bool = False,
+           tts_cmd = None,
+           timeout_seconds: int = 180):
+    
+    # sensible defaults
+    if llama_cli_path is None:
+        llama_cli_path = LLAMA_CLI if 'LLAMA_CLI' in globals() else str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli")
+    if model_path is None:
+        model_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+
+    exe = Path(llama_cli_path)
+    model = Path(model_path)
+
+    result = {
+        "generated": "",
+        "model_reply_time": 0.0,
+        "model_inference_time": None,
+        "tokens": 0,
+        "tts_time": 0.0,
+        "resource": {"peak_rss":0, "avg_rss":0, "peak_cpu":0.0, "avg_cpu":0.0, "samples":0},
+        "raw_stdout": "",
+        "raw_stderr": ""
+    }
+
+    if sampler is None:
+        sampler = ResourceSampler(interval=0.05)
+
+    if not exe.exists():
+        raise FileNotFoundError(f"llama-cli binary not found at: {exe}")
+    if not model.exists():
+        raise FileNotFoundError(f"qwen model not found at: {model}")
+
+    # build final prompt (prepend prefix if requested)
+    if instruct_prefix:
+        full_prompt = f"{instruct_prefix} {prompt_text.strip()}"
+    else:
+        full_prompt = prompt_text
+
+    # command — adjust flags if your llama-cli uses different flag names
+    cmd = [
+        str(exe),
+        "-m", str(model),
+        "-p", full_prompt,
+        "-n", str(n_predict),
+        "-t", str(threads),
+        "--temp", str(temperature),
+    ]
+
+    # run with resource sampling
+    sampler.start()
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+        t1 = time.time()
+    except subprocess.TimeoutExpired as e:
+        t1 = time.time()
+        sampler.stop()
+        result.update({
+            "raw_stdout": getattr(e, "stdout", "") or "",
+            "raw_stderr": getattr(e, "stderr", "") or "TIMEOUT",
+            "model_reply_time": t1 - t0
+        })
+        return result
+
+    sampler.stop()
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    result["raw_stdout"] = stdout
+    result["raw_stderr"] = stderr
+
+    result["model_reply_time"] = t1 - t0
+
+    # isolate generation: remove the prompt echo if present
+    generated = stdout
+    if full_prompt.strip() and full_prompt.strip() in generated:
+        parts = generated.split(full_prompt.strip())
+        if len(parts) > 1:
+            generated = parts[-1].strip()
+
+    # if stdout empty, fallback to stderr
+    if not generated and stderr:
+        generated = stderr.strip()
+
+    # last-ditch: filter diagnostic lines from combined output and take last useful line
+    if not generated:
+        combined = (stdout + "\n" + stderr).strip()
+        lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+        filtered = [ln for ln in lines if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace", "init"))]
+        if filtered:
+            generated = filtered[-1]
+
+    result["generated"] = (generated or "").strip()
+    result["tokens"] = len(result["generated"].split())
+
+    # Best-effort parse of any "inference time" or "total time" numbers in the raw output
+    inference_time = None
+    raw_combined = (stdout + "\n" + stderr).strip()
+    patterns = [
+        r"inference(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"total(?:_| |-)?time[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"elapsed[:=]?\s*([0-9]*\.?[0-9]+)\s*(ms|s)\b",
+        r"([0-9]*\.?[0-9]+)\s*ms\s*per\s*token",
+        r"([0-9]*\.?[0-9]+)\s*ms\b",
+        r"([0-9]*\.?[0-9]+)\s*s\b",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, raw_combined, flags=re.IGNORECASE):
+            num = m.group(1)
+            unit = m.group(2) if m.lastindex and m.lastindex >= 2 else None
+            try:
+                v = float(num)
+                if unit and unit.lower().startswith("ms"):
+                    v = v / 1000.0
+                if v > 0:
+                    inference_time = v
+                    break
+            except Exception:
+                continue
+        if inference_time is not None:
+            break
+    result["model_inference_time"] = inference_time
+
+    # resource summary
+    result["resource"] = sampler.summary()
+
+    # optional TTS (measured)
+    if tts_after and result["generated"]:
+        try:
+            tts_elapsed = speak_text_timed(result["generated"])  # will swallow exceptions
+        except Exception:
+            tts_elapsed = speak_text_timed(result["generated"]) if 'speak_text_timed' in globals() else 0.0
+        result["tts_time"] = tts_elapsed
+
+    return result
+
+
+
 def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
@@ -481,23 +628,17 @@ def format_bytes(n):
     return f"{n:.1f}TB"
 
 def main():
-    """
-    Flow:
-      1. record audio
-      2. transcribe (stt_elapsed)
-      3. call llama110 (explicit llama2 model path) with a short-answer instruction
-      4. print/return results
-      5. TTS only the first sentence
-    """
     total_start = time.time()
-
-    # 1) record
+    """
+    #  record
     wav = record_wav()
     if not wav:
         print("[MAIN] Recording failed.")
         return
-
-    # 2) STT
+    """
+    wav = str(Path.home() / "Rasberrypi-voice-assistant" / "recorded.wav")
+    
+    #  STT
     stt_start = time.time()
     transcribed = transcribe_audio(wav)
     stt_elapsed = time.time() - stt_start
@@ -508,13 +649,13 @@ def main():
         speak_text("Sorry, I did not hear anything.", max_sentences=1)
         return
 
-    # 3) Prepare prompt: ask the model explicitly for a short answer
-    # This PREVENTS long rambling answers for simple questions like "What is your name?"
+    
     short_prefix = "Answer in one short sentence. "
     prompt_to_model = short_prefix + transcribed.strip()
-
-    # 4) Call llama110 (uses llama2 model); pass a sampler to collect resources
     sampler = ResourceSampler(interval=0.05)
+    """
+    # llama110 
+    
     llama2_model_path = str(Path.home() / "Downloads" / "llama2.c-stories110M-pruned50.Q3_K_M.gguf")
     try:
         res = llama110(
@@ -531,8 +672,24 @@ def main():
     except FileNotFoundError as e:
         print("[MAIN] Error launching llama110:", e)
         return
+"""
 
-    # 5) Inspect result and fallback behavior
+    qwen_path = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+
+    res = qwen25(
+        prompt_text=transcribed,
+        llama_cli_path=LLAMA_CLI,    
+        model_path=qwen_path,
+        n_predict=16,
+        threads=4,
+        temperature=0.2,         
+        sampler=sampler,
+        instruct_prefix="Answer in one short sentence.",  
+        tts_after=False,
+        timeout_seconds=120)
+
+        
+        
     generated = res.get("generated", "")
     raw_stdout = res.get("raw_stdout", "") or ""
     raw_stderr = res.get("raw_stderr", "") or ""
@@ -550,24 +707,23 @@ def main():
         speak_text("Sorry, I couldn't get a reply from the model.", max_sentences=1)
         return
 
-    # 6) Clean generated: remove any remaining prompt echo or control garbage
+    
     cleaned = generated
     if prompt_to_model.strip() and prompt_to_model.strip() in cleaned:
-        # remove the prompt echo if present
+        
         cleaned = cleaned.split(prompt_to_model.strip(), 1)[-1].strip()
 
-    # trim trailing diagnostic lines if accidentally included
+    
     cleaned_lines = [ln for ln in cleaned.splitlines() if not any(k in ln.lower() for k in ("loaded", "mem", "tokens", "total time", "trace"))]
     cleaned = "\n".join(cleaned_lines).strip()
 
-    # 7) Print model reply to console (safe truncated printing)
+    
     print("\n[MAIN] Model reply (cleaned):")
     print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
 
-    # 8) Speak only the first sentence so it doesn't read long replies
-    # Use speak_text_safe or speak_text_timed depending on which you have
+    
     try:
-        tts_time = speak_text_timed(cleaned)  # your timed TTS wrapper
+        tts_time = speak_text_timed(cleaned)  
         # if you prefer sentence-limited safe wrapper: tts_time = speak_text_safe(cleaned, max_sentences=1)
     except Exception:
         # fallback to safe speak if speak_text_timed not available
