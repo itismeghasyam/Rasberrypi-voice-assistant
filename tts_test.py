@@ -36,7 +36,7 @@ def speak_text_piper(text: str, model_path="voices/en_US-amy-medium.onnx"):
             model.synthesize(text, f)
 
         # Play audio file
-        subprocess.run(["aplay", "piper_output.wav"], check=True)
+        subprocess.run(["paplay", "piper_output.wav"], check=True)
     except Exception as e:
         print("[TTS] Piper failed:", e)
 
