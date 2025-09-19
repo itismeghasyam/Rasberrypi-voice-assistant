@@ -21,9 +21,9 @@ def speak_text_espeak(text: str) -> None:
         print("[TTS] espeak failed:", e)
 
 # Base path (no extension, Piper will append .onnx and .onnx.json)
-model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium"
+model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
 
-def speak_text_piper(text: str, model_path=model_base.with_suffix(".onnx")):
+def speak_text_piper(text: str, model_path=model_base):
     """
     Speak text using Piper TTS and play through Bluetooth (PulseAudio).
     Uses raw PCM output like the CLI pipeline.
