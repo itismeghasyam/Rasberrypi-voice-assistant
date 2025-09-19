@@ -30,7 +30,16 @@ OLLAMA_URL = "http://192.168.0.102:11434/api/generate"
 OLLAMA_MODEL = "mistral"
 
 # Qwen (local, via llama.cpp)
-QWEN_MODEL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+QWEN_MODEL_SMALL = str(Path.home() / "Downloads" / "qwen2.5-0.5b-instruct-q3_k_m.gguf")
+QWEN_MODEL_LARGE = str(Path.home() / "Downloads" / "qwen2.5-1.5b-instruct-q3_k_m.gguf")
+# Maintain backwards compatibility with older references expecting QWEN_MODEL
+QWEN_MODEL = QWEN_MODEL_SMALL
+# SmallThinker (local, via llama.cpp)
+SMALLTHINKER_MODEL = str(Path.home() / "Downloads" / "SmallThinker-3B-Preview.Q3_K_M.gguf")
+# SmolLM (local, via llama.cpp)
+SMOLLM_MODEL = str(Path.home() / "Downloads" / "smollm-135m-instruct-add-basics-q8_0.gguf")
+# Select between the variants via the QWEN_MODEL_VARIANT env var (e.g. "1.5b", "large", "auto").
+# Set LLM_MODEL_VARIANT=smollm to target the SmolLM plug explicitly.
 
 
 _tts_engine = None
@@ -388,6 +397,7 @@ def llama110(prompt_text: str,
 def generate_response_local_llama(prompt_text, n_predict=128, threads=4, temperature=0.1):
     exe = Path(LLAMA_CLI)
     model = Path(LOCAL_MODEL)
+    sampler = ResourceSampler(interval=0.05)
 
     if not exe.exists() or not model.exists():
         missing = []
@@ -396,7 +406,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         if not model.exists():
             missing.append("local model")
         print("[LLM] Local llama not available (missing {}). Falling back to Ollama.".format(", ".join(missing)))
-        return None, None, None
+        return None, None, None, sampler.summary()
 
     prompt_escaped = prompt_text
     cmd = [
@@ -410,21 +420,38 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         "--top-k", "40",
     ]
 
-   
+
     print("[LLM] Running local llama:", " ".join(shlex.quote(c) for c in cmd))
+    sampler.start()
     start = time.time()
+    proc = None
+    timed_out = False
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 3)
+        # ensure llama.cpp does not try to switch into interactive mode by
+        # providing an explicit non-tty stdin.
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120 + n_predict * 3,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
+        timed_out = True
         print("[LLM] Local llama generation timed out")
-        return None, None, None
+    finally:
+        # Ensure the sampler stops even if subprocess.run raises unexpectedly.
+        sampler.stop()
+
     elapsed = time.time() - start
+    if timed_out or proc is None:
+        return None, None, None, sampler.summary()
 
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0
+        return "", elapsed, 0, sampler.summary()
 
-    
+
     generated = out
     if prompt_text.strip() and prompt_text.strip() in out:
         # split by the prompt and take the remainder
@@ -432,7 +459,7 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
         if len(parts) > 1:
             generated = parts[-1].strip()
 
-    
+
     lines = [l for l in generated.splitlines() if l.strip()]
     if lines:
         generated = "\n".join(lines).strip()
@@ -442,17 +469,36 @@ def generate_response_local_llama(prompt_text, n_predict=128, threads=4, tempera
     tps = tokens / elapsed if elapsed > 0 else 0.0
 
     print(f"[LLM] Local generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-    return generated, elapsed, tokens
+    return generated, elapsed, tokens, sampler.summary()
 
-def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
+def _run_qwen_llama_cpp(
+    model_path,
+    user_text,
+    *,
+    n_predict,
+    threads,
+    temperature,
+    extra_cli=None,
+    timeout_scale=12,
+    label="Qwen",
+):
     """
-    Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
-    Uses the same contract as generate_response_local_llama.
+    Shared helper to invoke llama.cpp with a given Qwen model and common hygiene.
+    Returns (generated_text, elapsed_seconds, token_estimate, resource_summary)
+    so callers can surface CPU/RSS statistics in their summaries.
     """
     exe = Path(LLAMA_CLI)
-    model = Path(QWEN_MODEL)
+    model = Path(model_path)
+    sampler = ResourceSampler(interval=0.05)
 
-    prompt_escaped = user_text
+    if not exe.exists():
+        print(f"[LLM] llama-cli binary not found: {exe}")
+        return None, None, None, sampler.summary()
+
+    if not model.exists():
+        print(f"[LLM] {label} model not found: {model}")
+        return None, None, None, sampler.summary()
+
     cmd = [
         str(exe),
         "-m", str(model),
@@ -462,23 +508,38 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
         "--temp", str(temperature),
         "--top-p", "0.2",
         "--top-k", "40",
-        "--simple-io",        # ensure pure non-interactive IO
-        "-ngl", "0",          # explicit: no GPU offload on Pi
-        "--ctx-size", "512",  # small context is enough here
     ]
 
-    print("[LLM] Running Qwen (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
+    if extra_cli:
+        cmd.extend(extra_cli)
+
+    print(f"[LLM] Running {label} (llama.cpp):", " ".join(shlex.quote(c) for c in cmd))
+    sampler.start()
     start = time.time()
+    proc = None
+    timed_out = False
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120 + n_predict * 12)
+        # Provide a dummy stdin so llama.cpp sees a non-interactive stream and
+        # exits once generation is finished instead of waiting for extra input.
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120 + n_predict * timeout_scale,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
-        print("[LLM] Qwen generation timed out")
-        return None, None, None
+        timed_out = True
+        print(f"[LLM] {label} generation timed out")
+    finally:
+        sampler.stop()
 
     elapsed = time.time() - start
+    if timed_out or proc is None:
+        return None, None, None, sampler.summary()
     out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
     if not out:
-        return "", elapsed, 0
+        return "", elapsed, 0, sampler.summary()
 
     # Strip echoed prompt if present
     generated = out
@@ -494,9 +555,199 @@ def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
 
     tokens = len(generated.split())
     tps = tokens / elapsed if elapsed > 0 else 0.0
-    print(f"[LLM] Qwen generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
-    return generated, elapsed, tokens
+    print(f"[LLM] {label} generation finished in {elapsed:.2f}s, approx tokens={tokens}, TPS={tps:.2f}")
+    return generated, elapsed, tokens, sampler.summary()
 
+
+def generate_response_qwen(user_text, n_predict=32, threads=4, temperature=0.2):
+    """
+    Run Qwen2.5 0.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
+    Uses the same contract as generate_response_local_llama.
+    """
+    return _run_qwen_llama_cpp(
+        QWEN_MODEL,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",        # ensure pure non-interactive IO
+            "-ngl", "0",          # explicit: no GPU offload on Pi
+            "--ctx-size", "512",  # small context is enough here
+        ],
+        timeout_scale=12,
+        label="Qwen 0.5B",
+    )
+
+
+def generate_response_qwen_large(user_text, n_predict=48, threads=4, temperature=0.2):
+    """
+    Run Qwen2.5 1.5B Instruct (quant: Q3_K_M) via llama.cpp's llama-cli.
+    Slightly longer default generation to take advantage of the larger model.
+    """
+    return _run_qwen_llama_cpp(
+        QWEN_MODEL_LARGE,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+            "--ctx-size", "1024",
+        ],
+        timeout_scale=16,
+        label="Qwen 1.5B",
+    )
+
+
+def generate_response_smallthinker(user_text, n_predict=64, threads=4, temperature=0.2):
+    """Run SmallThinker 3B Preview (quant: Q3_K_M) via llama.cpp's llama-cli."""
+    return _run_qwen_llama_cpp(
+        SMALLTHINKER_MODEL,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+            "--ctx-size", "1024",
+        ],
+        timeout_scale=20,
+        label="SmallThinker 3B",
+    )
+
+
+def generate_response_smollm(user_text, n_predict=48, threads=4, temperature=0.2):
+    """Run SmolLM 135M Instruct (quant: Q8_0) via llama.cpp's llama-cli."""
+    return _run_qwen_llama_cpp(
+        SMOLLM_MODEL,
+        user_text,
+        n_predict=n_predict,
+        threads=threads,
+        temperature=temperature,
+        extra_cli=[
+            "--simple-io",
+            "-ngl", "0",
+            "--ctx-size", "512",
+        ],
+        timeout_scale=8,
+        label="SmolLM 135M",
+    )
+
+
+def select_qwen_generator(preference=None):
+    """
+    Return a tuple (callable, label) for the preferred local llama.cpp model.
+    `preference` can be values like "0.5b", "small", "1.5b", "large", "smallthinker",
+    or "auto". If the requested model file is missing we fall back to an available
+    one and emit a short console notice.
+    """
+    pref_raw = preference if preference is not None else os.environ.get("QWEN_MODEL_VARIANT", "")
+    pref = (pref_raw or "").strip().lower()
+
+    large_exists = Path(QWEN_MODEL_LARGE).exists()
+    small_exists = Path(QWEN_MODEL).exists()
+    thinker_exists = Path(SMALLTHINKER_MODEL).exists()
+
+    large_alias = {"1.5b", "1_5b", "large", "big", "xl"}
+    small_alias = {"0.5b", "0_5b", "small", "default", "tiny"}
+    thinker_alias = {"smallthinker", "thinker", "3b", "3_b", "smallthinker-3b"}
+
+    if pref in thinker_alias:
+        if thinker_exists:
+            return generate_response_smallthinker, "SmallThinker 3B"
+        print(f"[MAIN] Preferred variant '{pref_raw}' not available at {SMALLTHINKER_MODEL}. Falling back to Qwen options.")
+        pref = "fallback-small"
+
+    if pref in large_alias:
+        if large_exists:
+            return generate_response_qwen_large, "Qwen 1.5B"
+        print(f"[MAIN] Preferred Qwen variant '{pref_raw}' not found at {QWEN_MODEL_LARGE}. Falling back to smaller model.")
+        pref = "fallback-small"
+
+    if pref in small_alias or not pref:
+        if small_exists:
+            return generate_response_qwen, "Qwen 0.5B"
+        if pref:
+            print(f"[MAIN] Preferred Qwen variant '{pref_raw}' not available at {QWEN_MODEL}.")
+        if large_exists:
+            print("[MAIN] Using Qwen 1.5B instead.")
+            return generate_response_qwen_large, "Qwen 1.5B"
+
+    if pref == "auto":
+        if large_exists:
+            return generate_response_qwen_large, "Qwen 1.5B"
+        if small_exists:
+            return generate_response_qwen, "Qwen 0.5B"
+        if thinker_exists:
+            return generate_response_smallthinker, "SmallThinker 3B"
+
+    known_aliases = large_alias | small_alias | thinker_alias | {"auto", "fallback-small"}
+    if pref not in known_aliases and pref:
+        print(
+            f"[MAIN] Unknown variant '{pref_raw}'. Valid options: 0.5B/small, 1.5B/large, "
+            "SmallThinker, auto."
+        )
+
+    if small_exists:
+        return generate_response_qwen, "Qwen 0.5B"
+    if large_exists:
+        return generate_response_qwen_large, "Qwen 1.5B"
+    if thinker_exists:
+        return generate_response_smallthinker, "SmallThinker 3B"
+
+    # If neither file is present we default to the small path so downstream
+    # errors point at the expected location.
+    return generate_response_qwen, "Qwen 0.5B"
+
+
+def select_llama_cpp_generator(preference=None, *, qwen_preference=None):
+    """
+    Choose between SmolLM and the existing Qwen/SmallThinker llama.cpp wrappers.
+    `preference` (or the LLM_MODEL_VARIANT env var) can be set to values like
+    "smollm" to explicitly opt into the SmolLM plug, or reuse the QWEN_MODEL_VARIANT
+    aliases (e.g. "0.5b", "1.5b", "smallthinker", "auto") to delegate to the
+    Qwen selector. `qwen_preference` lets callers forward an explicit
+    QWEN_MODEL_VARIANT override for backwards compatibility.
+    """
+
+    pref_raw = preference if preference is not None else os.environ.get("LLM_MODEL_VARIANT", "")
+    pref_clean = (pref_raw or "").strip()
+    pref = pref_clean.lower()
+
+    smollm_alias = {"smollm", "smol", "smollm-135m", "smollm135", "135m", "135m-instruct"}
+    smollm_exists = Path(SMOLLM_MODEL).exists()
+
+    if pref in smollm_alias:
+        if smollm_exists:
+            return generate_response_smollm, "SmolLM 135M"
+        print(f"[MAIN] Preferred SmolLM variant '{pref_raw}' not found at {SMOLLM_MODEL}. Falling back to Qwen options.")
+        # fall through to the Qwen selector using the provided preference/environment
+
+    q_passthrough_alias = {"qwen", "qwen2.5", "qwen2_5", "qwen25"}
+    q_pref_effective = qwen_preference if qwen_preference is not None else os.environ.get("QWEN_MODEL_VARIANT", "")
+    q_pref_to_use = q_pref_effective
+
+    if pref in q_passthrough_alias:
+        # Use the separate Qwen env var (or its default) when explicitly requesting "qwen"
+        q_pref_to_use = q_pref_effective
+    elif pref and pref not in smollm_alias:
+        # Allow reusing the general selector for Qwen aliases like "1.5b" or "smallthinker"
+        q_pref_to_use = pref
+
+    recognized = smollm_alias | q_passthrough_alias | {
+        "", "auto", "0.5b", "0_5b", "1.5b", "1_5b", "small", "large", "default", "tiny",
+        "smallthinker", "thinker", "3b", "3_b", "fallback-small",
+    }
+    if pref_clean and pref not in recognized:
+        print(
+            f"[MAIN] Unknown local model variant '{pref_raw}'. Valid options include SmolLM, "
+            "Qwen 0.5B/1.5B, SmallThinker, or auto."
+        )
+
+    return select_qwen_generator(q_pref_to_use)
 
 
 def generate_response_ollama(user_text, timeout=30):
@@ -556,21 +807,47 @@ def main():
     short_prefix = "Answer in one short sentence. "
     prompt_to_model = short_prefix + transcribed.strip()
 
-    # --- Qwen (via llama.cpp) ---
+    # --- Local llama.cpp models ---
     if not callable(globals().get("generate_response_qwen")):
         print("[MAIN] Missing generate_response_qwen(...). Add the Qwen wrapper first.")
         return
 
-    out_text, model_reply_time, _tok_est = generate_response_qwen(
-        prompt_to_model, n_predict=32, threads=4, temperature=0.2
+    qwen_pref = os.environ.get("QWEN_MODEL_VARIANT")
+    generator, model_label = select_llama_cpp_generator(qwen_preference=qwen_pref)
+    print(f"[MAIN] Using llama.cpp variant: {model_label}")
+
+    result = generator(
+        prompt_to_model,
+        threads=4,
+        temperature=0.2,
     )
+    out_text = None
+    model_reply_time = None
+    tok_estimate = None
+    resource_stats = None
+    if isinstance(result, tuple):
+        if len(result) > 0:
+            out_text = result[0]
+        if len(result) > 1:
+            model_reply_time = result[1]
+        if len(result) > 2:
+            tok_estimate = result[2]
+        if len(result) > 3:
+            resource_stats = result[3]
+    else:
+        out_text = result
+
     if out_text is None:
-        print("[MAIN] Qwen did not return output.")
+        print("[MAIN] The selected llama.cpp model did not return output.")
         return
 
     # Clean minimal (our wrapper already strips noise/echo)
     cleaned = out_text.strip()
     tokens = len(cleaned.split())
+    if tok_estimate is not None and tok_estimate > 0:
+        tokens = tok_estimate
+
+    resource_stats = resource_stats or {}
 
     print("\n[MAIN] Model reply:")
     print(cleaned if len(cleaned) < 2000 else cleaned[:2000] + "\n... (truncated)")
@@ -585,26 +862,36 @@ def main():
             tts_time = time.time() - tts_start
 
     total_elapsed = time.time() - total_start
+    if isinstance(model_reply_time, (int, float)):
+        model_reply_seconds = float(model_reply_time)
+    else:
+        model_reply_seconds = 0.0
 
     # Bench summary
     print("\n--- BENCH SUMMARY ---")
     print(f"STT time: {stt_elapsed:.3f}s")
-    print(f"Model reply time (wall): {model_reply_time:.3f}s")
+    print(f"Model reply time (wall): {model_reply_seconds:.3f}s")
     print("Model inference time (parsed): N/A")
     print(f"Tokens produced: {tokens}")
     print(f"TTS time: {tts_time:.3f}s")
     print(f"Total end-to-end: {total_elapsed:.3f}s")
-    print("Peak RSS: 0.0B, Avg RSS: 0.0B")  # not measured here
-    print("Peak CPU%: 0.0%, Avg CPU%: 0.0% (samples=0)")
+    peak_rss = float(resource_stats.get("peak_rss", 0) or 0)
+    avg_rss = float(resource_stats.get("avg_rss", 0) or 0)
+    peak_cpu = float(resource_stats.get("peak_cpu", 0.0) or 0.0)
+    avg_cpu = float(resource_stats.get("avg_cpu", 0.0) or 0.0)
+    samples = int(resource_stats.get("samples", 0) or 0)
+    print(f"Peak RSS: {format_bytes(peak_rss)}, Avg RSS: {format_bytes(avg_rss)}")
+    print(f"Peak CPU%: {peak_cpu:.1f}%, Avg CPU%: {avg_cpu:.1f}% (samples={samples})")
     print("----------------------\n")
 
     return {
         "transcription": transcribed,
         "generated": cleaned,
         "bench_total": total_elapsed,
-        "model_time": model_reply_time,
+        "model_time": model_reply_seconds,
         "tts_time": tts_time,
         "engine": "qwen",
+        "resource": resource_stats,
     }
 
 if __name__ == "__main__":
