@@ -1,19 +1,24 @@
+import os
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import time
 import threading
+import argparse
 from pathlib import Path
 import wave
 import psutil
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from voice_test import PROJECT_DIR
 
+PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 DURATION_SEC = 6
-MODEL_SIZES = ["tiny", "base", "small"]  # change as you like
-DEVICE = "cpu"  
-COMPUTE_TYPE = "int8"  
-    
+DEVICE = "cpu"
+COMPUTE_TYPE = "int8"   # try "int16" if you want a bit more accuracy on CPU
+CPU_THREADS = None      # e.g., set to 4 to pin threads, else CTranslate2 decides
+
 
 def record_wav(path=RECORDED_WAV, duration=DURATION_SEC, sr=SAMPLE_RATE):
     print(f"[REC] Recording {duration}s @ {sr}Hz -> {path}")
@@ -21,134 +26,160 @@ def record_wav(path=RECORDED_WAV, duration=DURATION_SEC, sr=SAMPLE_RATE):
     sd.wait()
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(audio.tobytes())
     print(f"[REC] Saved: {path}")
     return str(path)
 
 class ResourceSampler:
-    """Background sampler for CPU% and RSS."""
+    """Background sampler for process CPU% and RSS with blocking intervals for accuracy."""
     def __init__(self, pid=None, interval=0.2):
         self.proc = psutil.Process(pid or psutil.Process().pid)
         self.interval = interval
         self._stop = threading.Event()
-        self.cpu_samples = []
-        self.mem_samples = []
-        # prime cpu_percent to avoid first zero spike
-        self.proc.cpu_percent(None)
+        self.cpu = []
+        self.mem = []
 
     def start(self):
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        # prime measurement window
+        self.proc.cpu_percent(None)
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
 
     def _run(self):
         while not self._stop.is_set():
-            self.cpu_samples.append(self.proc.cpu_percent(interval=None))  # non-blocking
-            mem = self.proc.memory_info().rss  # bytes
-            self.mem_samples.append(mem)
-            time.sleep(self.interval)
+            self.cpu.append(self.proc.cpu_percent(interval=self.interval))
+            self.mem.append(self.proc.memory_info().rss)
 
     def stop(self):
         self._stop.set()
-        self.thread.join()
+        self._t.join()
 
     def summary(self):
-        if self.cpu_samples:
-            avg_cpu = sum(self.cpu_samples) / len(self.cpu_samples)
-            max_cpu = max(self.cpu_samples)
-        else:
-            avg_cpu = max_cpu = 0.0
-        max_rss = max(self.mem_samples) if self.mem_samples else self.proc.memory_info().rss
+        avg = sum(self.cpu) / len(self.cpu) if self.cpu else 0.0
+        mx = max(self.cpu) if self.cpu else 0.0
         cur_rss = self.proc.memory_info().rss
+        peak_rss = max(self.mem) if self.mem else cur_rss
         return {
-            "avg_cpu_percent": avg_cpu,
-            "max_cpu_percent": max_cpu,
-            "current_rss_mb": cur_rss / (1024**2),
-            "peak_rss_mb": max_rss / (1024**2),
+            "cpu_avg": avg,
+            "cpu_max": mx,
+            "rss_cur_mb": cur_rss / (1024**2),
+            "rss_peak_mb": peak_rss / (1024**2),
         }
 
-def fmt_secs(s): return f"{s:.2f}s"
+def fmt(s, w, align=">"):
+    return f"{s:{align}{w}}"
 
-def benchmark_once(audio_path, model_size):
+def print_summary(results):
+    cores = psutil.cpu_count(logical=True) or 1
+    cols = [
+        ("model", 8),
+        ("total_s", 8),
+        ("load_s", 8),
+        ("xcribe_s", 8),
+        ("cpu_avg%", 9),
+        ("cpu_max%", 9),
+        ("avg_norm%", 10),   # avg / cores
+        ("max_norm%", 10),   # max / cores
+        ("peak_MB", 8),
+        ("lang", 4),
+        ("chars", 5),
+    ]
+    header = " ".join(fmt(n, w) for n, w in cols)
+    print("\n===== Summary =====")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        row = [
+            r["model"],
+            f"{r['total_time_s']:.2f}",
+            f"{r['load_time_s']:.2f}",
+            f"{r['transcribe_time_s']:.2f}",
+            f"{r['cpu_avg_percent']:.1f}",
+            f"{r['cpu_max_percent']:.1f}",
+            f"{r['cpu_avg_percent']/cores:.1f}",
+            f"{r['cpu_max_percent']/cores:.1f}",
+            f"{r['rss_peak_mb']:.1f}",
+            r["detected_language"],
+            str(r["chars"]),
+        ]
+        print(" ".join(fmt(v, w) for v, (_, w) in zip(row, cols)))
+
+def benchmark_once(audio_path, model_size, language=None):
     print(f"\n===== Benchmark: model='{model_size}', device='{DEVICE}', compute_type='{COMPUTE_TYPE}' =====")
-
+    if CPU_THREADS:
+        print(f"[INFO] Limiting CPU threads to {CPU_THREADS}")
     proc = psutil.Process()
-    cpu_times_before = proc.cpu_times()
+    cpu_before = proc.cpu_times()
     wall_start = time.time()
 
-    # Start background sampler
     sampler = ResourceSampler(interval=0.15)
     sampler.start()
 
-    # 1) Load model
     t0 = time.time()
-    model = WhisperModel(model_size, device=DEVICE, compute_type=COMPUTE_TYPE)
+    model = WhisperModel(
+        model_size,
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE,
+        cpu_threads=CPU_THREADS
+    )
     load_time = time.time() - t0
-    print(f"[LOAD] Model loaded in {fmt_secs(load_time)}")
+    print(f"[LOAD] Model loaded in {load_time:.2f}s")
 
-    # 2) Transcribe
     t1 = time.time()
-    segments, info = model.transcribe(audio_path)
+    segments, info = model.transcribe(audio_path, language=language, task="transcribe")
     transcribe_time = time.time() - t1
 
-    # Stop sampler and compute stats
     sampler.stop()
-    wall_elapsed = time.time() - wall_start
-    cpu_times_after = proc.cpu_times()
-
-    # CPU times (process)
-    user_cpu = cpu_times_after.user - cpu_times_before.user
-    sys_cpu = cpu_times_after.system - cpu_times_before.system
-
-    # Stitch transcript (optional)
-    transcript = " ".join([seg.text for seg in segments]).strip()
-
-    # Resource summary
+    wall = time.time() - wall_start
+    cpu_after = proc.cpu_times()
+    user_cpu = cpu_after.user - cpu_before.user
+    sys_cpu = cpu_after.system - cpu_before.system
     res = sampler.summary()
 
+    transcript = " ".join(seg.text for seg in segments).strip()
+
     print(f"[INFO] Language: {info.language}")
-    print(f"[TIME] Load: {fmt_secs(load_time)} | Transcribe: {fmt_secs(transcribe_time)} | Total: {fmt_secs(wall_elapsed)}")
-    print(f"[CPU ] user: {user_cpu:.2f}s | system: {sys_cpu:.2f}s | avg%: {res['avg_cpu_percent']:.1f} | max%: {res['max_cpu_percent']:.1f}")
-    print(f"[MEM ] RSS now: {res['current_rss_mb']:.1f} MB | Peak (sampled): {res['peak_rss_mb']:.1f} MB")
+    print(f"[TIME] Load: {load_time:.2f}s | Transcribe: {transcribe_time:.2f}s | Total: {wall:.2f}s")
+    print(f"[CPU ] user: {user_cpu:.2f}s | system: {sys_cpu:.2f}s | avg%: {res['cpu_avg']:.1f} | max%: {res['cpu_max']:.1f}")
+    print(f"[MEM ] RSS now: {res['rss_cur_mb']:.1f} MB | Peak (sampled): {res['rss_peak_mb']:.1f} MB")
     print(f"[TEXT] {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
 
     return {
         "model": model_size,
-        "device": DEVICE,
-        "compute_type": COMPUTE_TYPE,
         "load_time_s": load_time,
         "transcribe_time_s": transcribe_time,
-        "total_time_s": wall_elapsed,
-        "cpu_user_s": user_cpu,
-        "cpu_system_s": sys_cpu,
-        "cpu_avg_percent": res["avg_cpu_percent"],
-        "cpu_max_percent": res["max_cpu_percent"],
-        "rss_current_mb": res["current_rss_mb"],
-        "rss_peak_mb": res["peak_rss_mb"],
+        "total_time_s": wall,
+        "cpu_avg_percent": res["cpu_avg"],
+        "cpu_max_percent": res["cpu_max"],
+        "rss_peak_mb": res["rss_peak_mb"],
         "detected_language": info.language,
         "chars": len(transcript),
     }
 
-def main():
-    audio_file = record_wav()
-    results = []
-    for m in MODEL_SIZES:
-        results.append(benchmark_once(audio_file, m))
+def parse_args():
+    p = argparse.ArgumentParser(description="Faster-Whisper CPU benchmark")
+    p.add_argument("--models", type=str, default="tiny")
+    p.add_argument("--repeat", type=int, default=1, help="Repeat runs per model (default 1)")
+    p.add_argument("--language", type=str, default=None, help="Force language code (e.g., en)")
+    p.add_argument("--skip-record", action="store_true", help="Skip recording and reuse recorded.wav")
+    return p.parse_args()
 
-    # Pretty print summary table
-    print("\n===== Summary =====")
-    cols = [
-        "model","total_time_s","load_time_s","transcribe_time_s",
-        "cpu_avg_percent","cpu_max_percent",
-        "rss_peak_mb","detected_language","chars"
-    ]
-    header = " | ".join(f"{c:>18}" for c in cols)
-    print(header)
-    print("-"*len(header))
-    for r in results:
-        row = " | ".join(f"{str(round(r[c],2) if isinstance(r[c], (int,float)) else r[c]):>18}" for c in cols)
-        print(row)
+def main():
+    args = parse_args()
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not args.skip_record or not RECORDED_WAV.exists():
+        record_wav()
+
+    results = []
+    for m in models:
+        for i in range(args.repeat):
+            if args.repeat > 1:
+                print(f"\n--- Run {i+1}/{args.repeat} for model {m} ---")
+            results.append(benchmark_once(str(RECORDED_WAV), m, language=args.language))
+
+    print_summary(results)
 
 if __name__ == "__main__":
     main()
