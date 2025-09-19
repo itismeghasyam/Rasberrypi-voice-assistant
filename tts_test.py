@@ -20,7 +20,7 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium")
+model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx")
 
 def speak_text_piper(text: str, model_path=str(model_path)):
     """
