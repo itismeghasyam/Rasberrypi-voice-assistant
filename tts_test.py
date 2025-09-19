@@ -20,9 +20,9 @@ def speak_text_espeak(text: str) -> None:
     except Exception as e:
         print("[TTS] espeak failed:", e)
 
-model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx")
+model_path = str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium")
 
-def speak_text_piper(text: str, model_path=model_path):
+def speak_text_piper(text: str, model_path=str(model_path)):
     """
     Speak text using Piper TTS engine and play via PulseAudio (BT speakers).
     Converts Piper's raw PCM into a valid WAV.
@@ -34,22 +34,30 @@ def speak_text_piper(text: str, model_path=model_path):
     print("[TTS] Piper Speak:", text)
 
     try:
-        # Load Piper model
+        # Load Piper voice (uses .onnx + .onnx.json together)
         model = piper.PiperVoice.load(model_path)
 
         # Capture raw PCM output into memory buffer
         buffer = io.BytesIO()
         model.synthesize(text, buffer)
 
-        # Get raw bytes and convert to numpy
         raw_bytes = buffer.getvalue()
         samples = np.frombuffer(raw_bytes, dtype=np.int16)
 
+        print("[TTS] Piper generated samples:", len(samples))
+
+        if len(samples) == 0:
+            print("[TTS] Warning: Piper returned no audio. Check that both .onnx and .onnx.json exist.")
+            return
+
+        # Try to get real sample rate from model (fallback to 22050 Hz)
+        rate = getattr(model, "sample_rate", 22050)
+
         # Save as proper WAV
         with wave.open("piper_output.wav", "wb") as wf:
-            wf.setnchannels(1)        # mono
-            wf.setsampwidth(2)        # 16-bit
-            wf.setframerate(22050)    # sample rate (Piper default for Amy medium)
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
             wf.writeframes(samples.tobytes())
 
         # Play via PulseAudio (Bluetooth)
