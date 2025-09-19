@@ -11,6 +11,11 @@ from pathlib import Path
 import wave
 import psutil
 import sounddevice as sd
+import subprocess, shlex, re
+
+# whisper.cpp config
+WHISPER_EXE_PATH = str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli")
+WHISPER_MODEL = str(Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin")
 
 
 from faster_whisper import WhisperModel
@@ -21,6 +26,12 @@ PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 DURATION_SEC = 6
+
+
+#Whisper config
+WHISPER_EXE_PATH = str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli")
+WHISPER_MODEL = str(Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin")
+
 
 # Faster-Whisper defaults 
 DEVICE = "cpu"
@@ -155,6 +166,72 @@ def benchmark_once_fw(audio_path, model_size, language=None):
         "detected_language": info.language,
         "chars": len(transcript),
     }
+
+
+#Whisper 
+def benchmark_once_whispercpp(audio_path):
+    print(f"\n===== Benchmark (whisper.cpp): exe='{WHISPER_EXE_PATH}', model='{WHISPER_MODEL}' =====")
+    proc = psutil.Process()
+    cpu_before = proc.cpu_times()
+    wall_start = time.time()
+
+    sampler = ResourceSampler(interval=0.15)
+    sampler.start()
+
+    # --- load time (binary + model startup) ---
+    t0 = time.time()
+    exe = Path(WHISPER_EXE_PATH)
+    model = Path(WHISPER_MODEL)
+    if not exe.exists():
+        raise FileNotFoundError(f"Whisper binary not found: {exe}")
+    if not model.exists():
+        raise FileNotFoundError(f"Whisper model not found: {model}")
+    load_time = time.time() - t0   # here, "load" is trivial, actual cost is inside run
+
+    # --- transcription ---
+    t1 = time.time()
+    cmd = [str(exe), "-m", str(model), "-f", str(audio_path), "--no-prints", "--output-txt"]
+    print("[STT] Running:", " ".join(shlex.quote(c) for c in cmd))
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("[STT] Timeout expired")
+        return None
+    transcribe_time = time.time() - t1
+
+    # read result
+    txt_path1 = Path(audio_path).with_suffix(".txt")
+    txt_path2 = Path(str(audio_path) + ".txt")
+    transcript = ""
+    for p in (txt_path1, txt_path2):
+        if p.exists():
+            transcript = p.read_text(encoding="utf-8").strip()
+            break
+
+    sampler.stop()
+    wall = time.time() - wall_start
+    cpu_after = proc.cpu_times()
+    user_cpu = cpu_after.user - cpu_before.user
+    sys_cpu  = cpu_after.system - cpu_before.system
+    res = sampler.summary()
+
+    print(f"[TIME] Load: {load_time:.2f}s | Transcribe: {transcribe_time:.2f}s | Total: {wall:.2f}s")
+    print(f"[CPU ] user: {user_cpu:.2f}s | system: {sys_cpu:.2f}s | avg%: {res['cpu_avg']:.1f} | max%: {res['cpu_max']:.1f}")
+    print(f"[MEM ] RSS now: {res['rss_cur_mb']:.1f} MB | Peak (sampled): {res['rss_peak_mb']:.1f} MB")
+    print(f"[TEXT] {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
+
+    return {
+        "model": "whisper.cpp-tiny",
+        "load_time_s": load_time,
+        "transcribe_time_s": transcribe_time,
+        "total_time_s": wall,
+        "cpu_avg_percent": res["cpu_avg"],
+        "cpu_max_percent": res["cpu_max"],
+        "rss_peak_mb": res["rss_peak_mb"],
+        "detected_language": "unk",   # whisper.cpp doesn’t output lang unless you add --lang
+        "chars": len(transcript),
+    }
+
 
 # Whisper-distil
 def benchmark_once_distil(audio_path, model_id="distil-whisper/distil-small.en"):
@@ -293,7 +370,7 @@ def benchmark_once_vosk(audio_path, model_dir= str(Path.home() / "models" / "vos
 # CLI 
 def parse_args():
     p = argparse.ArgumentParser(description="STT benchmarks (Faster-Whisper or Vosk)")
-    p.add_argument("--engine", choices=["fw", "vosk","distil"], default="fw",
+    p.add_argument("--engine", choices=["fw", "vosk","distil","whisper"], default="fw",
                    help="Engine to benchmark: fw (Faster-Whisper) or vosk")
     p.add_argument("--models", type=str, default="tiny",
                    help="FW: comma-separated models (e.g., tiny or tiny,base). Ignored for Vosk.")
@@ -340,6 +417,14 @@ def main():
         res["record_time_s"] = record_time
         res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
         results.append(res)
+        
+    elif args.engine == "whispercpp":
+        res = benchmark_once_whispercpp(str(RECORDED_WAV))
+        if res:
+            res["record_time_s"] = record_time
+            res["total_e2e_s"] = res["total_time_s"] + (record_time if args.include_record else 0.0)
+            results.append(res)
+
 
 
     else:  # Vosk
