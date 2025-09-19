@@ -71,40 +71,34 @@ class ResourceSampler:
 def fmt(s, w, align=">"):
     return f"{s:{align}{w}}"
 
-def print_summary(results):
+def print_summary(results, include_record=False):
     cores = psutil.cpu_count(logical=True) or 1
-    cols = [
-        ("model", 8),
-        ("total_s", 8),
-        ("load_s", 8),
-        ("xcribe_s", 8),
-        ("cpu_avg%", 9),
-        ("cpu_max%", 9),
-        ("avg_norm%", 10),   # avg / cores
-        ("max_norm%", 10),   # max / cores
-        ("peak_MB", 8),
-        ("lang", 4),
-        ("chars", 5),
-    ]
-    header = " ".join(fmt(n, w) for n, w in cols)
     print("\n===== Summary =====")
-    print(header)
-    print("-" * len(header))
     for r in results:
-        row = [
-            r["model"],
-            f"{r['total_time_s']:.2f}",
-            f"{r['load_time_s']:.2f}",
-            f"{r['transcribe_time_s']:.2f}",
-            f"{r['cpu_avg_percent']:.1f}",
-            f"{r['cpu_max_percent']:.1f}",
-            f"{r['cpu_avg_percent']/cores:.1f}",
-            f"{r['cpu_max_percent']/cores:.1f}",
-            f"{r['rss_peak_mb']:.1f}",
-            r["detected_language"],
-            str(r["chars"]),
+        parts = [
+            f"model: {r['model']}",
+            # include record and e2e only if present/desired
         ]
-        print(" ".join(fmt(v, w) for v, (_, w) in zip(row, cols)))
+        if 'record_time_s' in r:
+            parts.append(f"record_s: {r['record_time_s']:.2f}")
+        parts.extend([
+            f"total_s: {r['total_time_s']:.2f}",
+        ])
+        if include_record and 'total_e2e_s' in r:
+            parts.append(f"e2e_s: {r['total_e2e_s']:.2f}")
+        parts.extend([
+            f"load_s: {r['load_time_s']:.2f}",
+            f"xcribe_s: {r['transcribe_time_s']:.2f}",
+            f"cpu_avg%: {r['cpu_avg_percent']:.1f}",
+            f"cpu_max%: {r['cpu_max_percent']:.1f}",
+            f"avg_norm%: {r['cpu_avg_percent']/cores:.1f}",
+            f"max_norm%: {r['cpu_max_percent']/cores:.1f}",
+            f"peak_MB: {r['rss_peak_mb']:.1f}",
+            f"lang: {r['detected_language']}",
+            f"chars: {r['chars']}",
+        ])
+        print(", ".join(parts))
+
 
 def benchmark_once(audio_path, model_size, language=None):
     print(f"\n===== Benchmark: model='{model_size}', device='{DEVICE}', compute_type='{COMPUTE_TYPE}' =====")
