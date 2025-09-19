@@ -23,7 +23,7 @@ def speak_text_espeak(text: str) -> None:
 # Base path (no extension, Piper will append .onnx and .onnx.json)
 model_base = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium"
 
-def speak_text_piper(text: str, model_path=str(model_base)):
+def speak_text_piper(text: str):
     """
     Speak text using Piper TTS engine and play via PulseAudio (BT speakers).
     Converts Piper's raw PCM into a valid WAV.
@@ -36,7 +36,11 @@ def speak_text_piper(text: str, model_path=str(model_base)):
 
     try:
         # Load Piper voice (uses .onnx + .onnx.json together)
-        model = piper.PiperVoice.load(model_path)
+        model = piper.PiperVoice.load(
+                model_path="/home/kushal/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx",
+                config_path="/home/kushal/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx.json"
+                )
+
 
         # Capture raw PCM output
         buffer = io.BytesIO()
