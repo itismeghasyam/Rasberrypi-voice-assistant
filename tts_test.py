@@ -64,7 +64,7 @@ def speak_text_kitten(text: str, voice: str = "expr-voice-2-f", speed: float = 1
         return None, None
 
 
-def speak_text_nix(text: str, model_dir: str = MODEL_DIR):
+def speak_text_nix(text: str, model_dir: str = model_nix):
     """
     Nix-TTS: tokenize expects list[str]. Plays via PulseAudio (Bluetooth).
     Returns (wav_path, sample_rate) on success, else (None, None).
