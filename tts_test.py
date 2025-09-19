@@ -6,6 +6,7 @@ import piper
 from pathlib import Path
 import numpy as np
 import wave
+import io 
 def speak_text_espeak(text: str) -> None:
     
     text = (text or "").strip()
