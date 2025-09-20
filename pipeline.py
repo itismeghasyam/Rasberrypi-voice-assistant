@@ -27,10 +27,12 @@ import subprocess
 import threading
 import time
 import wave
+
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
 
 import numpy as np
 import psutil
@@ -334,10 +336,12 @@ class BufferedTTS:
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
         timeout: int = 30,
+
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
+
     ) -> None:
         self.model_path = Path(model_path)
         self.timeout = int(timeout)
@@ -346,6 +350,7 @@ class BufferedTTS:
         self.playing = False
         self._playback_thread: Optional[threading.Thread] = None
         self.playback_cmd = list(playback_cmd) if playback_cmd else ["paplay"]
+
         self.use_subprocess = bool(use_subprocess)
         if output_device is None:
             self.output_device = None
@@ -360,6 +365,7 @@ class BufferedTTS:
             self.output_device = output_device
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
+
 
     def start_playback(self) -> None:
         if self.playing:
@@ -377,6 +383,7 @@ class BufferedTTS:
 
             if not audio_file:
                 continue
+
 
             played = False
             if not self.use_subprocess:
@@ -448,6 +455,7 @@ class BufferedTTS:
             print(f"[TTS] Subprocess playback failed for {audio_file}: {exc}")
             return False
 
+
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
         clean_text = (text or "").strip()
         if not clean_text:
@@ -497,6 +505,7 @@ class BufferedTTS:
 
 
 @dataclass
+
 class PendingOutput:
     timestamp: float
     segments_expected: int
@@ -504,17 +513,20 @@ class PendingOutput:
 
 
 @dataclass
+
 class PipelineStats:
     stt_chunks: int = 0
     llm_responses: int = 0
     tts_segments: int = 0
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
+
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
     tts_generation_latencies: List[float] = field(default_factory=list)
     input_to_output_latencies: List[float] = field(default_factory=list)
     pending_outputs: Deque[PendingOutput] = field(default_factory=deque)
+
 
 
 class ParallelVoiceAssistant:
@@ -528,13 +540,16 @@ class ParallelVoiceAssistant:
         vosk_model_dir: Path = VOSK_MODEL_DIR,
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
+
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
         force_subprocess_playback: bool = False,
+
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(num_workers=stt_workers, engine="vosk", sample_rate=sample_rate, vosk_model_dir=vosk_model_dir)
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
+
         self.tts = BufferedTTS(
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
@@ -549,6 +564,7 @@ class ParallelVoiceAssistant:
         self.stats = PipelineStats()
         self._stt_done = threading.Event()
         self._pending_lock = threading.Lock()
+
 
     def run(self, duration: float = 15.0) -> None:
         print(f"[MAIN] Starting streaming assistant for ~{duration:.1f}s")
@@ -575,7 +591,9 @@ class ParallelVoiceAssistant:
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
+
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
+
             self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
@@ -601,7 +619,9 @@ class ParallelVoiceAssistant:
                     continue
 
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
+
                 self.stt_futures.put((chunk_id, future, time.time()))
+
                 self.stats.stt_chunks += 1
                 chunk_id += 1
 
@@ -613,9 +633,11 @@ class ParallelVoiceAssistant:
             pass
 
     def _process_stt_results(self, wait: bool) -> None:
+
         pending: List[Tuple[int, Future, float]] = []
         while not self.stt_futures.empty():
             chunk_id, future, start_time = self.stt_futures.get()
+
             if wait or future.done():
                 try:
                     result = future.result()
@@ -623,14 +645,18 @@ class ParallelVoiceAssistant:
                     print(f"[STT Pipeline] Future for chunk {chunk_id} failed: {exc}")
                     continue
             else:
+
                 pending.append((chunk_id, future, start_time))
+
                 continue
 
             if not result:
                 continue
 
+
             latency = max(0.0, time.time() - start_time)
             self.stats.stt_latencies.append(latency)
+
 
             text = (result.get("text") or "").strip()
             is_final = bool(result.get("is_final"))
@@ -639,10 +665,12 @@ class ParallelVoiceAssistant:
             if text:
                 print(f"[STT] Chunk {res_chunk_id}: {text}")
 
+
             llm_trigger_time = time.time()
             llm_future = self.llm.process_incremental(text, is_final=is_final)
             if llm_future is not None:
                 self.llm_futures.put((llm_future, llm_trigger_time, llm_trigger_time))
+
 
         for item in pending:
             self.stt_futures.put(item)
@@ -651,7 +679,9 @@ class ParallelVoiceAssistant:
         segment_id = 0
         while not self._stt_done.is_set() or not self.llm_futures.empty():
             try:
+
                 llm_future, start_time, input_timestamp = self.llm_futures.get(timeout=0.5)
+
             except queue.Empty:
                 continue
 
@@ -662,8 +692,10 @@ class ParallelVoiceAssistant:
                 print(f"[LLM Pipeline] Error: {exc}")
                 continue
 
+
             latency = max(0.0, time.time() - start_time)
             self.stats.llm_latencies.append(latency)
+
 
             response = (response or "").strip()
             if not response:
@@ -671,6 +703,7 @@ class ParallelVoiceAssistant:
 
             print(f"[LLM] Response: {response[:120]}{'...' if len(response) > 120 else ''}")
             self.stats.llm_responses += 1
+
 
             sentences = self._split_sentences(response)
             if not sentences:
@@ -748,6 +781,7 @@ class ParallelVoiceAssistant:
             if pending.segments_expected == 0:
                 self.stats.pending_outputs.popleft()
 
+
     # --------------------------- Helpers -------------------------
 
     @staticmethod
@@ -763,6 +797,7 @@ class ParallelVoiceAssistant:
             sentences.append(" ".join(current))
         return sentences
 
+
     @staticmethod
     def _print_latency_summary(label: str, samples: List[float]) -> None:
         if not samples:
@@ -774,6 +809,7 @@ class ParallelVoiceAssistant:
         max_val = max(samples)
         print(f"{label}: avg {avg:.2f}s (min {min_val:.2f}s, max {max_val:.2f}s, n={len(samples)})")
 
+
     def _print_stats(self, elapsed: float) -> None:
         print("\n--- PIPELINE STATS ---")
         print(f"Runtime: {elapsed:.2f}s")
@@ -784,10 +820,12 @@ class ParallelVoiceAssistant:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / (1024 * 1024)
         print(f"Memory usage: {mem_mb:.1f} MB")
+
         self._print_latency_summary("STT chunk latency", list(self.stats.stt_latencies))
         self._print_latency_summary("LLM response latency", list(self.stats.llm_latencies))
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
+
         print("----------------------\n")
 
 
@@ -866,6 +904,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
     parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
     parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
+
     parser.add_argument("--output-device", type=str, default=None, help="sounddevice output (index or name) for Piper playback")
     parser.add_argument("--playback-cmd", nargs="+", default=None, help="Fallback playback command for Piper audio")
     parser.add_argument(
@@ -873,6 +912,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip direct sounddevice playback and always use the playback command",
     )
+
     return parser.parse_args()
 
 
@@ -900,9 +940,11 @@ def main() -> None:
         vosk_model_dir=args.vosk_model,
         piper_model_path=args.piper_model,
         llama_kwargs=llama_kwargs,
+
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
         force_subprocess_playback=args.force_subprocess_playback,
+
     )
     assistant.run(duration=args.duration)
 
