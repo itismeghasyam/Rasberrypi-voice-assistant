@@ -225,7 +225,7 @@ class ParallelSTT:
         ]
         text = ""
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            subprocess.run(cmd, capture_output=True, text=True, timeout=6)
             txt_path = wav_path.with_suffix(".txt")
             alt_txt = Path(str(wav_path) + ".txt")
             if txt_path.exists():
