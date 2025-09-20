@@ -27,9 +27,12 @@ import subprocess
 import threading
 import time
 import wave
+
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
 
 import numpy as np
 import psutil
@@ -333,6 +336,12 @@ class BufferedTTS:
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
         timeout: int = 30,
+
+        output_device: Optional[Any] = None,
+        use_subprocess: bool = False,
+        on_playback_start: Optional[Callable[[str, float], None]] = None,
+        on_playback_error: Optional[Callable[[], None]] = None,
+
     ) -> None:
         self.model_path = Path(model_path)
         self.timeout = int(timeout)
@@ -341,6 +350,22 @@ class BufferedTTS:
         self.playing = False
         self._playback_thread: Optional[threading.Thread] = None
         self.playback_cmd = list(playback_cmd) if playback_cmd else ["paplay"]
+
+        self.use_subprocess = bool(use_subprocess)
+        if output_device is None:
+            self.output_device = None
+        elif isinstance(output_device, int):
+            self.output_device = output_device
+        elif isinstance(output_device, str):
+            try:
+                self.output_device = int(output_device)
+            except ValueError:
+                self.output_device = output_device
+        else:
+            self.output_device = output_device
+        self.on_playback_start = on_playback_start
+        self.on_playback_error = on_playback_error
+
 
     def start_playback(self) -> None:
         if self.playing:
@@ -359,15 +384,77 @@ class BufferedTTS:
             if not audio_file:
                 continue
 
+
+            played = False
+            if not self.use_subprocess:
+                played = self._play_via_sounddevice(audio_file)
+
+            if not played and self.playback_cmd:
+                played = self._play_via_subprocess(audio_file)
+
+            if not played:
+                print(f"[TTS] Playback failed for {audio_file}")
+                self._notify_playback_error()
+
             try:
-                subprocess.run(self.playback_cmd + [audio_file], check=False)
-            except Exception as exc:
-                print(f"[TTS] Playback failed for {audio_file}: {exc}")
-            finally:
-                try:
-                    Path(audio_file).unlink(missing_ok=True)
-                except OSError:
-                    pass
+                Path(audio_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _notify_playback_error(self) -> None:
+        if self.on_playback_error is None:
+            return
+        try:
+            self.on_playback_error()
+        except Exception as exc:
+            print(f"[TTS] Playback error callback failed: {exc}")
+
+    def _play_via_sounddevice(self, audio_file: str) -> bool:
+        try:
+            with wave.open(audio_file, "rb") as wf:
+                sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                frames = wf.getnframes()
+                audio_bytes = wf.readframes(frames)
+
+            dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+            dtype = dtype_map.get(sampwidth)
+            if dtype is None:
+                raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+            audio = np.frombuffer(audio_bytes, dtype=dtype)
+            if dtype == np.uint8:
+                audio = audio.astype(np.float32)
+                audio = (audio - 128.0) / 128.0
+            else:
+                max_val = float(np.iinfo(dtype).max)
+                if not max_val:
+                    raise ValueError("Invalid max value for dtype")
+                audio = audio.astype(np.float32) / max_val
+
+            if channels > 1:
+                audio = audio.reshape(-1, channels)
+
+            sd.play(audio, sample_rate, device=self.output_device, blocking=False)
+            if self.on_playback_start:
+                self.on_playback_start(audio_file, time.time())
+            sd.wait()
+            return True
+        except Exception as exc:
+            print(f"[TTS] Direct playback failed for {audio_file}: {exc}")
+            return False
+
+    def _play_via_subprocess(self, audio_file: str) -> bool:
+        try:
+            if self.on_playback_start:
+                self.on_playback_start(audio_file, time.time())
+            subprocess.run(self.playback_cmd + [audio_file], check=False)
+            return True
+        except Exception as exc:
+            print(f"[TTS] Subprocess playback failed for {audio_file}: {exc}")
+            return False
+
 
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
         clean_text = (text or "").strip()
@@ -418,12 +505,28 @@ class BufferedTTS:
 
 
 @dataclass
+
+class PendingOutput:
+    timestamp: float
+    segments_expected: int
+    latency_recorded: bool = False
+
+
+@dataclass
+
 class PipelineStats:
     stt_chunks: int = 0
     llm_responses: int = 0
     tts_segments: int = 0
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
+
+    stt_latencies: List[float] = field(default_factory=list)
+    llm_latencies: List[float] = field(default_factory=list)
+    tts_generation_latencies: List[float] = field(default_factory=list)
+    input_to_output_latencies: List[float] = field(default_factory=list)
+    pending_outputs: Deque[PendingOutput] = field(default_factory=deque)
+
 
 
 class ParallelVoiceAssistant:
@@ -437,16 +540,31 @@ class ParallelVoiceAssistant:
         vosk_model_dir: Path = VOSK_MODEL_DIR,
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
+
+        output_device: Optional[Any] = None,
+        playback_cmd: Optional[Iterable[str]] = None,
+        force_subprocess_playback: bool = False,
+
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(num_workers=stt_workers, engine="vosk", sample_rate=sample_rate, vosk_model_dir=vosk_model_dir)
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
-        self.tts = BufferedTTS(model_path=piper_model_path)
 
-        self.stt_futures: "queue.Queue[tuple[int, Future]]" = queue.Queue()
-        self.llm_futures: "queue.Queue[Future]" = queue.Queue()
+        self.tts = BufferedTTS(
+            model_path=piper_model_path,
+            playback_cmd=playback_cmd,
+            output_device=output_device,
+            use_subprocess=force_subprocess_playback,
+            on_playback_start=self._on_tts_playback_start,
+            on_playback_error=self._on_tts_playback_error,
+        )
+
+        self.stt_futures: "queue.Queue[Tuple[int, Future, float]]" = queue.Queue()
+        self.llm_futures: "queue.Queue[Tuple[Future, float, float]]" = queue.Queue()
         self.stats = PipelineStats()
         self._stt_done = threading.Event()
+        self._pending_lock = threading.Lock()
+
 
     def run(self, duration: float = 15.0) -> None:
         print(f"[MAIN] Starting streaming assistant for ~{duration:.1f}s")
@@ -473,7 +591,9 @@ class ParallelVoiceAssistant:
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
-            self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future))
+
+            self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
+
             self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
@@ -499,7 +619,9 @@ class ParallelVoiceAssistant:
                     continue
 
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
-                self.stt_futures.put((chunk_id, future))
+
+                self.stt_futures.put((chunk_id, future, time.time()))
+
                 self.stats.stt_chunks += 1
                 chunk_id += 1
 
@@ -511,9 +633,11 @@ class ParallelVoiceAssistant:
             pass
 
     def _process_stt_results(self, wait: bool) -> None:
-        pending: List[tuple[int, Future]] = []
+
+        pending: List[Tuple[int, Future, float]] = []
         while not self.stt_futures.empty():
-            chunk_id, future = self.stt_futures.get()
+            chunk_id, future, start_time = self.stt_futures.get()
+
             if wait or future.done():
                 try:
                     result = future.result()
@@ -521,11 +645,18 @@ class ParallelVoiceAssistant:
                     print(f"[STT Pipeline] Future for chunk {chunk_id} failed: {exc}")
                     continue
             else:
-                pending.append((chunk_id, future))
+
+                pending.append((chunk_id, future, start_time))
+
                 continue
 
             if not result:
                 continue
+
+
+            latency = max(0.0, time.time() - start_time)
+            self.stats.stt_latencies.append(latency)
+
 
             text = (result.get("text") or "").strip()
             is_final = bool(result.get("is_final"))
@@ -534,9 +665,12 @@ class ParallelVoiceAssistant:
             if text:
                 print(f"[STT] Chunk {res_chunk_id}: {text}")
 
+
+            llm_trigger_time = time.time()
             llm_future = self.llm.process_incremental(text, is_final=is_final)
             if llm_future is not None:
-                self.llm_futures.put(llm_future)
+                self.llm_futures.put((llm_future, llm_trigger_time, llm_trigger_time))
+
 
         for item in pending:
             self.stt_futures.put(item)
@@ -545,7 +679,9 @@ class ParallelVoiceAssistant:
         segment_id = 0
         while not self._stt_done.is_set() or not self.llm_futures.empty():
             try:
-                llm_future = self.llm_futures.get(timeout=0.5)
+
+                llm_future, start_time, input_timestamp = self.llm_futures.get(timeout=0.5)
+
             except queue.Empty:
                 continue
 
@@ -556,6 +692,11 @@ class ParallelVoiceAssistant:
                 print(f"[LLM Pipeline] Error: {exc}")
                 continue
 
+
+            latency = max(0.0, time.time() - start_time)
+            self.stats.llm_latencies.append(latency)
+
+
             response = (response or "").strip()
             if not response:
                 continue
@@ -563,11 +704,83 @@ class ParallelVoiceAssistant:
             print(f"[LLM] Response: {response[:120]}{'...' if len(response) > 120 else ''}")
             self.stats.llm_responses += 1
 
-            for sentence in self._split_sentences(response):
+
+            sentences = self._split_sentences(response)
+            if not sentences:
+                sentences = [response]
+
+            tts_jobs: List[Tuple[Future, float]] = []
+            for sentence in sentences:
+                submit_time = time.time()
                 future = self.tts.generate_and_queue(sentence, segment_id)
                 if future is not None:
                     self.stats.tts_segments += 1
+                    tts_jobs.append((future, submit_time))
                 segment_id += 1
+
+            if not tts_jobs:
+                continue
+
+            pending = PendingOutput(timestamp=input_timestamp, segments_expected=len(tts_jobs))
+            with self._pending_lock:
+                self.stats.pending_outputs.append(pending)
+
+            for future, submit_time in tts_jobs:
+                future.add_done_callback(
+                    lambda fut, start=submit_time, pending_ref=pending: self._on_tts_generated(fut, start, pending_ref)
+                )
+
+    def _on_tts_generated(self, future: Future, start_time: float, pending: PendingOutput) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            print(f"[TTS Pipeline] Generation failed: {exc}")
+            self._handle_failed_tts_generation(pending)
+            return
+
+        if result:
+            latency = max(0.0, time.time() - start_time)
+            self.stats.tts_generation_latencies.append(latency)
+        else:
+            self._handle_failed_tts_generation(pending)
+
+    def _handle_failed_tts_generation(self, pending: PendingOutput) -> None:
+        with self._pending_lock:
+            pending.segments_expected = max(0, pending.segments_expected - 1)
+            if pending.segments_expected == 0:
+                try:
+                    self.stats.pending_outputs.remove(pending)
+                except ValueError:
+                    pass
+
+    def _on_tts_playback_start(self, file_path: str, started_at: float) -> None:
+        with self._pending_lock:
+            while self.stats.pending_outputs:
+                pending = self.stats.pending_outputs[0]
+                if pending.segments_expected <= 0:
+                    self.stats.pending_outputs.popleft()
+                    continue
+
+                if not pending.latency_recorded:
+                    latency = max(0.0, started_at - pending.timestamp)
+                    self.stats.input_to_output_latencies.append(latency)
+                    pending.latency_recorded = True
+
+                pending.segments_expected = max(0, pending.segments_expected - 1)
+                if pending.segments_expected == 0:
+                    self.stats.pending_outputs.popleft()
+                break
+
+    def _on_tts_playback_error(self) -> None:
+        with self._pending_lock:
+            if not self.stats.pending_outputs:
+                return
+
+            pending = self.stats.pending_outputs[0]
+            pending.segments_expected = max(0, pending.segments_expected - 1)
+            if pending.segments_expected == 0:
+                self.stats.pending_outputs.popleft()
+
 
     # --------------------------- Helpers -------------------------
 
@@ -584,6 +797,19 @@ class ParallelVoiceAssistant:
             sentences.append(" ".join(current))
         return sentences
 
+
+    @staticmethod
+    def _print_latency_summary(label: str, samples: List[float]) -> None:
+        if not samples:
+            print(f"{label}: n/a")
+            return
+
+        avg = sum(samples) / len(samples)
+        min_val = min(samples)
+        max_val = max(samples)
+        print(f"{label}: avg {avg:.2f}s (min {min_val:.2f}s, max {max_val:.2f}s, n={len(samples)})")
+
+
     def _print_stats(self, elapsed: float) -> None:
         print("\n--- PIPELINE STATS ---")
         print(f"Runtime: {elapsed:.2f}s")
@@ -594,6 +820,12 @@ class ParallelVoiceAssistant:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / (1024 * 1024)
         print(f"Memory usage: {mem_mb:.1f} MB")
+
+        self._print_latency_summary("STT chunk latency", list(self.stats.stt_latencies))
+        self._print_latency_summary("LLM response latency", list(self.stats.llm_latencies))
+        self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
+        self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
+
         print("----------------------\n")
 
 
@@ -672,6 +904,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
     parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
     parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
+
+    parser.add_argument("--output-device", type=str, default=None, help="sounddevice output (index or name) for Piper playback")
+    parser.add_argument("--playback-cmd", nargs="+", default=None, help="Fallback playback command for Piper audio")
+    parser.add_argument(
+        "--force-subprocess-playback",
+        action="store_true",
+        help="Skip direct sounddevice playback and always use the playback command",
+    )
+
     return parser.parse_args()
 
 
@@ -699,6 +940,11 @@ def main() -> None:
         vosk_model_dir=args.vosk_model,
         piper_model_path=args.piper_model,
         llama_kwargs=llama_kwargs,
+
+        output_device=args.output_device,
+        playback_cmd=args.playback_cmd,
+        force_subprocess_playback=args.force_subprocess_playback,
+
     )
     assistant.run(duration=args.duration)
 
