@@ -28,10 +28,12 @@ import threading
 import time
 import wave
 
+
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
 
 
 import numpy as np
@@ -50,6 +52,12 @@ PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 2.0  # seconds
+
+
+DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
+DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
+
+
 
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
@@ -337,11 +345,13 @@ class BufferedTTS:
         playback_cmd: Optional[Iterable[str]] = None,
         timeout: int = 30,
 
+      
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
 
+      
     ) -> None:
         self.model_path = Path(model_path)
         self.timeout = int(timeout)
@@ -351,6 +361,7 @@ class BufferedTTS:
         self._playback_thread: Optional[threading.Thread] = None
         self.playback_cmd = list(playback_cmd) if playback_cmd else ["paplay"]
 
+        
         self.use_subprocess = bool(use_subprocess)
         if output_device is None:
             self.output_device = None
@@ -366,6 +377,13 @@ class BufferedTTS:
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
 
+        
+        self._playback_env = os.environ.copy()
+        if isinstance(self.output_device, str):
+            # Hint to PulseAudio-based players which sink to target.
+            self._playback_env.setdefault("PULSE_SINK", self.output_device)
+
+          
 
     def start_playback(self) -> None:
         if self.playing:
@@ -385,6 +403,7 @@ class BufferedTTS:
                 continue
 
 
+                
             played = False
             if not self.use_subprocess:
                 played = self._play_via_sounddevice(audio_file)
@@ -436,6 +455,11 @@ class BufferedTTS:
             if channels > 1:
                 audio = audio.reshape(-1, channels)
 
+
+                
+            sd.stop()
+
+  
             sd.play(audio, sample_rate, device=self.output_device, blocking=False)
             if self.on_playback_start:
                 self.on_playback_start(audio_file, time.time())
@@ -449,13 +473,29 @@ class BufferedTTS:
         try:
             if self.on_playback_start:
                 self.on_playback_start(audio_file, time.time())
-            subprocess.run(self.playback_cmd + [audio_file], check=False)
+
+                
+            cmd = list(self.playback_cmd)
+            if (
+                isinstance(self.output_device, str)
+                and cmd
+                and cmd[0] == "paplay"
+                and not any(str(arg).startswith("--device=") for arg in cmd[1:])
+            ):
+                cmd = cmd + [f"--device={self.output_device}"]
+            subprocess.run(cmd + [audio_file], check=True, env=self._playback_env)
             return True
+        except subprocess.CalledProcessError as exc:
+            print(f"[TTS] Subprocess playback failed (exit {exc.returncode}) for {audio_file}: {exc}")
+            return False
+
+          
         except Exception as exc:
             print(f"[TTS] Subprocess playback failed for {audio_file}: {exc}")
             return False
 
 
+          
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
         clean_text = (text or "").strip()
         if not clean_text:
@@ -506,6 +546,7 @@ class BufferedTTS:
 
 @dataclass
 
+
 class PendingOutput:
     timestamp: float
     segments_expected: int
@@ -514,6 +555,7 @@ class PendingOutput:
 
 @dataclass
 
+
 class PipelineStats:
     stt_chunks: int = 0
     llm_responses: int = 0
@@ -521,12 +563,18 @@ class PipelineStats:
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
 
+      
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
     tts_generation_latencies: List[float] = field(default_factory=list)
     input_to_output_latencies: List[float] = field(default_factory=list)
     pending_outputs: Deque[PendingOutput] = field(default_factory=deque)
 
+      
+    recording_stop_time: Optional[float] = None
+    recording_to_first_llm_latency: Optional[float] = None
+
+      
 
 
 class ParallelVoiceAssistant:
@@ -541,15 +589,20 @@ class ParallelVoiceAssistant:
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
 
+      
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
         force_subprocess_playback: bool = False,
+        silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
+        silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
 
+      
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(num_workers=stt_workers, engine="vosk", sample_rate=sample_rate, vosk_model_dir=vosk_model_dir)
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
 
+        
         self.tts = BufferedTTS(
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
@@ -565,11 +618,60 @@ class ParallelVoiceAssistant:
         self._stt_done = threading.Event()
         self._pending_lock = threading.Lock()
 
+        
+        self._activity_lock = threading.Lock()
+        self._activity_event = threading.Event()
+        self._last_voice_time = time.time()
+        self._has_detected_speech = False
+        self._recording_stop_time: Optional[float] = None
+        self._silence_timeout = float(silence_timeout)
+        self._silence_threshold = float(silence_threshold)
 
-    def run(self, duration: float = 15.0) -> None:
-        print(f"[MAIN] Starting streaming assistant for ~{duration:.1f}s")
+    def _register_activity(self) -> None:
+        with self._activity_lock:
+            self._has_detected_speech = True
+            self._last_voice_time = time.time()
+        self._activity_event.set()
+
+    def _is_silent_chunk(self, audio_chunk: np.ndarray) -> bool:
+        if audio_chunk.size == 0:
+            return True
+        audio_view = np.asarray(audio_chunk, dtype=np.int16)
+        if audio_view.ndim > 1:
+            audio_view = audio_view.reshape(-1)
+        rms = float(np.sqrt(np.mean(np.square(audio_view.astype(np.float32)))))
+        return rms < self._silence_threshold
+
+    def _reference_timestamp_for_output(self, input_timestamp: float) -> float:
+        candidates = [input_timestamp]
+        with self._activity_lock:
+            candidates.append(self._last_voice_time)
+        if self._recording_stop_time is not None:
+            candidates.append(self._recording_stop_time)
+        return max(candidates)
+
+    def run(self, duration: Optional[float] = None) -> None:
+        max_duration = duration if duration and duration > 0 else None
+        if max_duration is not None:
+            print(
+                f"[MAIN] Starting streaming assistant (max {max_duration:.1f}s, "
+                f"silence timeout {self._silence_timeout:.1f}s)"
+            )
+        else:
+            print(f"[MAIN] Starting streaming assistant (silence timeout {self._silence_timeout:.1f}s)")
+
         start_time = time.time()
         self.stats.start_time = start_time
+        self.stats.recording_stop_time = None
+        self.stats.recording_to_first_llm_latency = None
+        self._stt_done.clear()
+        self._activity_event.clear()
+        with self._activity_lock:
+            self._has_detected_speech = False
+            self._last_voice_time = start_time
+        self._recording_stop_time = None
+
+        
 
         self.recorder.start()
         self.tts.start_playback()
@@ -581,19 +683,53 @@ class ParallelVoiceAssistant:
         llm_thread.start()
 
         try:
-            time.sleep(duration)
+
+          
+            while True:
+                now = time.time()
+                if max_duration is not None and now - start_time >= max_duration:
+                    print(f"[MAIN] Max duration {max_duration:.1f}s reached; wrapping up.")
+                    break
+
+                with self._activity_lock:
+                    has_voice = self._has_detected_speech
+                    last_voice = self._last_voice_time
+
+                if has_voice and (now - last_voice) >= self._silence_timeout:
+                    print(f"[MAIN] Detected {self._silence_timeout:.1f}s of silence; stopping recorder.")
+                    break
+
+                wait_timeout = 0.5
+                if has_voice:
+                    remaining = self._silence_timeout - (now - last_voice)
+                    wait_timeout = max(0.1, min(0.5, remaining))
+
+                triggered = self._activity_event.wait(timeout=wait_timeout)
+                if triggered:
+                    self._activity_event.clear()
+
+                    
         except KeyboardInterrupt:
             print("\n[MAIN] Interrupted by user")
         finally:
             self.recorder.stop()
+
+            
+            stop_time = time.time()
+            self._recording_stop_time = stop_time
+            self.stats.recording_stop_time = stop_time
+
+      
 
         stt_thread.join(timeout=5.0)
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
 
+          
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
 
+  
             self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
@@ -618,10 +754,15 @@ class ParallelVoiceAssistant:
                     self._process_stt_results(wait=False)
                     continue
 
-                future = self.stt.submit_chunk(audio_chunk, chunk_id)
 
+                    
+                if not self._is_silent_chunk(audio_chunk):
+                    self._register_activity()
+
+                future = self.stt.submit_chunk(audio_chunk, chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
 
+          
                 self.stats.stt_chunks += 1
                 chunk_id += 1
 
@@ -634,10 +775,12 @@ class ParallelVoiceAssistant:
 
     def _process_stt_results(self, wait: bool) -> None:
 
+      
         pending: List[Tuple[int, Future, float]] = []
         while not self.stt_futures.empty():
             chunk_id, future, start_time = self.stt_futures.get()
 
+          
             if wait or future.done():
                 try:
                     result = future.result()
@@ -646,8 +789,10 @@ class ParallelVoiceAssistant:
                     continue
             else:
 
+              
                 pending.append((chunk_id, future, start_time))
 
+  
                 continue
 
             if not result:
@@ -663,13 +808,15 @@ class ParallelVoiceAssistant:
             res_chunk_id = result.get("chunk_id", chunk_id)
 
             if text:
-                print(f"[STT] Chunk {res_chunk_id}: {text}")
 
+                self._register_activity()
+                print(f"[STT] Chunk {res_chunk_id}: {text}")
 
             llm_trigger_time = time.time()
             llm_future = self.llm.process_incremental(text, is_final=is_final)
             if llm_future is not None:
-                self.llm_futures.put((llm_future, llm_trigger_time, llm_trigger_time))
+                reference_time = self._reference_timestamp_for_output(llm_trigger_time)
+                self.llm_futures.put((llm_future, llm_trigger_time, reference_time))
 
 
         for item in pending:
@@ -688,13 +835,24 @@ class ParallelVoiceAssistant:
             response = ""
             try:
                 response = llm_future.result(timeout=300)
+
+                response_ready_time = time.time()
+
             except Exception as exc:
                 print(f"[LLM Pipeline] Error: {exc}")
                 continue
 
 
-            latency = max(0.0, time.time() - start_time)
+            latency = max(0.0, response_ready_time - start_time)
             self.stats.llm_latencies.append(latency)
+
+            if (
+                self.stats.recording_to_first_llm_latency is None
+                and self._recording_stop_time is not None
+            ):
+                self.stats.recording_to_first_llm_latency = max(
+                    0.0, response_ready_time - self._recording_stop_time
+                )
 
 
             response = (response or "").strip()
@@ -721,7 +879,10 @@ class ParallelVoiceAssistant:
             if not tts_jobs:
                 continue
 
-            pending = PendingOutput(timestamp=input_timestamp, segments_expected=len(tts_jobs))
+
+            pending_timestamp = self._reference_timestamp_for_output(input_timestamp)
+            pending = PendingOutput(timestamp=pending_timestamp, segments_expected=len(tts_jobs))
+
             with self._pending_lock:
                 self.stats.pending_outputs.append(pending)
 
@@ -781,7 +942,6 @@ class ParallelVoiceAssistant:
             if pending.segments_expected == 0:
                 self.stats.pending_outputs.popleft()
 
-
     # --------------------------- Helpers -------------------------
 
     @staticmethod
@@ -823,6 +983,13 @@ class ParallelVoiceAssistant:
 
         self._print_latency_summary("STT chunk latency", list(self.stats.stt_latencies))
         self._print_latency_summary("LLM response latency", list(self.stats.llm_latencies))
+        if self.stats.recording_to_first_llm_latency is not None:
+            print(
+                "Recording -> first LLM response: "
+                f"{self.stats.recording_to_first_llm_latency:.2f}s"
+            )
+        else:
+            print("Recording -> first LLM response: n/a")
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
@@ -913,6 +1080,19 @@ def _parse_args() -> argparse.Namespace:
         help="Skip direct sounddevice playback and always use the playback command",
     )
 
+    parser.add_argument(
+        "--silence-timeout",
+        type=float,
+        default=DEFAULT_SILENCE_TIMEOUT,
+        help="Seconds of silence before automatically stopping the recorder",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=DEFAULT_SILENCE_THRESHOLD,
+        help="RMS amplitude threshold (int16) to treat chunks as silence",
+    )
+
     return parser.parse_args()
 
 
@@ -944,9 +1124,12 @@ def main() -> None:
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
         force_subprocess_playback=args.force_subprocess_playback,
-
+        silence_timeout=args.silence_timeout,
+        silence_threshold=args.silence_threshold,
     )
-    assistant.run(duration=args.duration)
+    max_duration = args.duration if args.duration and args.duration > 0 else None
+    assistant.run(duration=max_duration)
+
 
 
 if __name__ == "__main__":
