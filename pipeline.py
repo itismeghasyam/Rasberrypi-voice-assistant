@@ -24,10 +24,11 @@ import json
 import os
 import queue
 import subprocess
+
+import tempfile
 import threading
 import time
 import wave
-
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -51,12 +52,10 @@ from voice_test import llama110
 PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 3.0  # seconds
 
-
+CHUNK_DURATION = 2.0  # seconds
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
-
 
 
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
@@ -132,6 +131,10 @@ class ParallelSTT:
         self.sample_rate = int(sample_rate)
         self.vosk_model_dir = Path(vosk_model_dir)
 
+        self._last_partial_text = ""
+        self._filler_tokens = {"huh", "uh", "um", "hmm", "h", "uhh"}
+
+
         if self.engine == "vosk":
             if not self.vosk_model_dir.exists():
                 raise FileNotFoundError(
@@ -166,9 +169,22 @@ class ParallelSTT:
                 if recognizer.AcceptWaveform(audio_bytes):
                     result = json.loads(recognizer.Result())
                     text = result.get("text", "")
+
+                    self._last_partial_text = ""
                 else:
                     partial = json.loads(recognizer.PartialResult())
                     text = partial.get("partial", "")
+                    normalized = text.strip().lower()
+                    if (
+                        not normalized
+                        or normalized == self._last_partial_text
+                        or (len(normalized) < 4 and " " not in normalized)
+                        or normalized in self._filler_tokens
+                    ):
+                        text = ""
+                    else:
+                        self._last_partial_text = normalized
+
 
                 if is_final:
                     final = json.loads(recognizer.FinalResult())
@@ -178,6 +194,9 @@ class ParallelSTT:
                         text = (f"{text} {final_text}" if text else final_text).strip()
                     # Reset recognizer for the next session
                     self._recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
+
+                    self._last_partial_text = ""
+
             except Exception as exc:
                 print(f"[STT][Vosk] Error decoding chunk {chunk_id}: {exc}")
                 text = ""
@@ -196,6 +215,9 @@ class ParallelSTT:
                     print(f"[STT][Vosk] Error during finalization: {exc}")
                 finally:
                     self._recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
+
+                    self._last_partial_text = ""
+
         return {"chunk_id": chunk_id, "text": text.strip(), "is_final": True}
 
     # --------------------- Whisper processing --------------------
@@ -225,7 +247,9 @@ class ParallelSTT:
         ]
         text = ""
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+
+            subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
             txt_path = wav_path.with_suffix(".txt")
             alt_txt = Path(str(wav_path) + ".txt")
             if txt_path.exists():
@@ -336,6 +360,25 @@ class StreamingLLM:
 # ================================================================
 
 
+
+@dataclass
+class SpeechSegment:
+    path: str
+    raw: bytes
+    sample_rate: int
+    channels: int = 1
+    sampwidth: int = 2
+
+
+@dataclass
+class PiperVoiceInfo:
+    sample_rate: int = 22050
+    speaker_id: Optional[int] = None
+    channels: int = 1
+    metadata_path: Optional[Path] = None
+
+
+
 class BufferedTTS:
     """Generate speech with Piper asynchronously and stream playback via paplay."""
 
@@ -343,25 +386,36 @@ class BufferedTTS:
         self,
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
-        timeout: int = 6,
 
-      
+        timeout: int = 30,
+
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
 
-      
     ) -> None:
         self.model_path = Path(model_path)
         self.timeout = int(timeout)
-        self.speech_queue: "queue.Queue[str]" = queue.Queue()
+        self._voice_info = self._load_voice_info()
+        self.speech_queue: "queue.Queue[SpeechSegment]" = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.playing = False
         self._playback_thread: Optional[threading.Thread] = None
-        self.playback_cmd = list(playback_cmd) if playback_cmd else ["paplay"]
+        if playback_cmd:
+            self.playback_cmd = list(playback_cmd)
+        else:
+            self.playback_cmd = [
+                "aplay",
+                "-r",
+                str(self._voice_info.sample_rate),
+                "-f",
+                "S16_LE",
+                "-t",
+                "raw",
+                "-",
+            ]
 
-        
         self.use_subprocess = bool(use_subprocess)
         if output_device is None:
             self.output_device = None
@@ -377,13 +431,61 @@ class BufferedTTS:
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
 
-        
+
         self._playback_env = os.environ.copy()
         if isinstance(self.output_device, str):
             # Hint to PulseAudio-based players which sink to target.
             self._playback_env.setdefault("PULSE_SINK", self.output_device)
 
-          
+
+    def _load_voice_info(self) -> PiperVoiceInfo:
+        candidates = [
+            self.model_path.with_suffix(self.model_path.suffix + ".json"),
+            self.model_path.with_suffix(".json"),
+        ]
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                metadata = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            audio = metadata.get("audio", {}) if isinstance(metadata, dict) else {}
+            sample_rate = int(audio.get("sample_rate") or metadata.get("sample_rate", 22050))
+            channels = int(audio.get("channels", 1) or 1)
+
+            speaker_id: Optional[int] = None
+            if "speaker_id" in metadata:
+                try:
+                    speaker_id = int(metadata.get("speaker_id"))
+                except Exception:
+                    speaker_id = None
+            elif isinstance(metadata.get("speakers"), dict):
+                speakers_dict: Dict[str, Any] = metadata.get("speakers", {})
+                if speakers_dict:
+                    first_key = next(iter(speakers_dict))
+                    first_val = speakers_dict[first_key]
+                    if isinstance(first_val, dict) and "id" in first_val:
+                        try:
+                            speaker_id = int(first_val["id"])
+                        except Exception:
+                            speaker_id = None
+                    else:
+                        try:
+                            speaker_id = int(first_key)
+                        except Exception:
+                            speaker_id = None
+
+            return PiperVoiceInfo(
+                sample_rate=sample_rate or 22050,
+                speaker_id=speaker_id,
+                channels=channels or 1,
+                metadata_path=candidate,
+            )
+
+        return PiperVoiceInfo()
+
 
     def start_playback(self) -> None:
         if self.playing:
@@ -395,28 +497,29 @@ class BufferedTTS:
     def _playback_loop(self) -> None:
         while self.playing:
             try:
-                audio_file = self.speech_queue.get(timeout=0.5)
+
+                segment = self.speech_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            if not audio_file:
+            if not segment:
                 continue
 
-
-                
             played = False
             if not self.use_subprocess:
-                played = self._play_via_sounddevice(audio_file)
+                played = self._play_via_sounddevice(segment)
 
             if not played and self.playback_cmd:
-                played = self._play_via_subprocess(audio_file)
+                played = self._play_via_subprocess(segment)
 
             if not played:
-                print(f"[TTS] Playback failed for {audio_file}")
+                print(f"[TTS] Playback failed for {segment.path}")
                 self._notify_playback_error()
 
             try:
-                Path(audio_file).unlink(missing_ok=True)
+                if segment.path:
+                    Path(segment.path).unlink(missing_ok=True)
+
             except OSError:
                 pass
 
@@ -428,111 +531,144 @@ class BufferedTTS:
         except Exception as exc:
             print(f"[TTS] Playback error callback failed: {exc}")
 
-    def _play_via_sounddevice(self, audio_file: str) -> bool:
+
+    def _play_via_sounddevice(self, segment: SpeechSegment) -> bool:
         try:
-            with wave.open(audio_file, "rb") as wf:
-                sample_rate = wf.getframerate()
-                channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                frames = wf.getnframes()
-                audio_bytes = wf.readframes(frames)
-
-            dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
-            dtype = dtype_map.get(sampwidth)
-            if dtype is None:
-                raise ValueError(f"Unsupported sample width: {sampwidth}")
-
-            audio = np.frombuffer(audio_bytes, dtype=dtype)
-            if dtype == np.uint8:
-                audio = audio.astype(np.float32)
-                audio = (audio - 128.0) / 128.0
-            else:
-                max_val = float(np.iinfo(dtype).max)
-                if not max_val:
-                    raise ValueError("Invalid max value for dtype")
+            if segment.raw:
+                audio = np.frombuffer(segment.raw, dtype=np.int16)
+                max_val = float(np.iinfo(np.int16).max)
                 audio = audio.astype(np.float32) / max_val
+                if segment.channels > 1:
+                    audio = audio.reshape(-1, segment.channels)
+                sample_rate = segment.sample_rate
+            else:
+                with wave.open(segment.path, "rb") as wf:
+                    sample_rate = wf.getframerate()
+                    channels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    frames = wf.getnframes()
+                    audio_bytes = wf.readframes(frames)
 
-            if channels > 1:
-                audio = audio.reshape(-1, channels)
+                dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+                dtype = dtype_map.get(sampwidth)
+                if dtype is None:
+                    raise ValueError(f"Unsupported sample width: {sampwidth}")
 
+                audio = np.frombuffer(audio_bytes, dtype=dtype)
+                if dtype == np.uint8:
+                    audio = audio.astype(np.float32)
+                    audio = (audio - 128.0) / 128.0
+                else:
+                    max_val = float(np.iinfo(dtype).max)
+                    if not max_val:
+                        raise ValueError("Invalid max value for dtype")
+                    audio = audio.astype(np.float32) / max_val
 
-                
+                if channels > 1:
+                    audio = audio.reshape(-1, channels)
+
             sd.stop()
-
-  
             sd.play(audio, sample_rate, device=self.output_device, blocking=False)
             if self.on_playback_start:
-                self.on_playback_start(audio_file, time.time())
+                self.on_playback_start(segment.path, time.time())
             sd.wait()
             return True
         except Exception as exc:
-            print(f"[TTS] Direct playback failed for {audio_file}: {exc}")
+            print(f"[TTS] Direct playback failed for {segment.path}: {exc}")
             return False
 
-    def _play_via_subprocess(self, audio_file: str) -> bool:
+    def _play_via_subprocess(self, segment: SpeechSegment) -> bool:
         try:
             if self.on_playback_start:
-                self.on_playback_start(audio_file, time.time())
-
-                
+                self.on_playback_start(segment.path, time.time())
             cmd = list(self.playback_cmd)
-            if (
-                isinstance(self.output_device, str)
-                and cmd
-                and cmd[0] == "paplay"
-                and not any(str(arg).startswith("--device=") for arg in cmd[1:])
-            ):
-                cmd = cmd + [f"--device={self.output_device}"]
-            subprocess.run(cmd + [audio_file], check=True, env=self._playback_env)
+            if isinstance(self.output_device, str) and cmd:
+                if (
+                    cmd[0] == "paplay"
+                    and not any(str(arg).startswith("--device=") for arg in cmd[1:])
+                ):
+                    cmd = cmd + [f"--device={self.output_device}"]
+                elif cmd[0] == "aplay" and "-D" not in cmd:
+                    cmd = cmd[:1] + ["-D", self.output_device] + cmd[1:]
+            if any("{file}" in str(part) for part in cmd):
+                resolved = [str(part).replace("{file}", segment.path) for part in cmd]
+                subprocess.run(resolved, check=True, env=self._playback_env)
+            elif cmd and cmd[-1] == "-" and segment.raw is not None:
+                subprocess.run(cmd, input=segment.raw, check=True, env=self._playback_env)
+            else:
+                subprocess.run(cmd + [segment.path], check=True, env=self._playback_env)
             return True
         except subprocess.CalledProcessError as exc:
-            print(f"[TTS] Subprocess playback failed (exit {exc.returncode}) for {audio_file}: {exc}")
+            print(f"[TTS] Subprocess playback failed (exit {exc.returncode}) for {segment.path}: {exc}")
             return False
-
-          
         except Exception as exc:
-            print(f"[TTS] Subprocess playback failed for {audio_file}: {exc}")
+            print(f"[TTS] Subprocess playback failed for {segment.path}: {exc}")
             return False
 
 
-          
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
         clean_text = (text or "").strip()
         if not clean_text:
             return None
         return self.executor.submit(self._generate_speech, clean_text, segment_id)
 
-    def _generate_speech(self, text: str, segment_id: int) -> Optional[str]:
+
+    def _generate_speech(self, text: str, segment_id: int) -> Optional[SpeechSegment]:
+
         if not self.model_path.exists():
             print(f"[TTS] Piper model not found: {self.model_path}")
             return None
 
-        output_file = Path(f"{PROJECT_DIR}/{segment_id}.wav")
-        cmd = [
-            "piper",
-            "-m", str(self.model_path),
-            "--output-raw"
-        ]
+
+        info = self._voice_info
+        cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
+        if info.sample_rate:
+            cmd += ["--sample-rate", str(info.sample_rate)]
+        if info.speaker_id is not None:
+            cmd += ["--speaker", str(info.speaker_id)]
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        keep_file = False
         try:
-            subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=self.timeout)
-            proc = subprocess.Popen(
-            ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
-            stdin=subprocess.PIPE)
-            
-            piper_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=proc.stdin)
-            piper_proc.communicate(input=text.encode("utf-8"))
-            
-            
-            self.speech_queue.put(str(output_file))
-            return str(output_file)
+            proc = subprocess.run(
+                cmd,
+                input=text.encode("utf-8"),
+                capture_output=True,
+                check=True,
+                timeout=self.timeout,
+            )
+            audio_bytes = proc.stdout
+            if not audio_bytes:
+                print("[TTS] Piper returned no audio data")
+                return None
+
+            with wave.open(str(tmp_path), "wb") as wf:
+                wf.setnchannels(info.channels or 1)
+                wf.setsampwidth(2)
+                wf.setframerate(info.sample_rate or 22050)
+                wf.writeframes(audio_bytes)
+            keep_file = True
+
+            segment = SpeechSegment(
+                path=str(tmp_path),
+                raw=audio_bytes,
+                sample_rate=info.sample_rate or 22050,
+                channels=info.channels or 1,
+            )
+            self.speech_queue.put(segment)
+            return segment
+
         except subprocess.CalledProcessError as exc:
             print(f"[TTS] Piper returned error: {exc}")
         except Exception as exc:
             print(f"[TTS] Piper failed: {exc}")
         finally:
-            if not output_file.exists():
+
+            if not keep_file and tmp_path.exists():
                 try:
-                    output_file.unlink(missing_ok=True)
+                    tmp_path.unlink(missing_ok=True)
+
                 except OSError:
                     pass
         return None
@@ -569,18 +705,16 @@ class PipelineStats:
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
 
-      
+
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
     tts_generation_latencies: List[float] = field(default_factory=list)
     input_to_output_latencies: List[float] = field(default_factory=list)
     pending_outputs: Deque[PendingOutput] = field(default_factory=deque)
 
-      
     recording_stop_time: Optional[float] = None
     recording_to_first_llm_latency: Optional[float] = None
 
-      
 
 
 class ParallelVoiceAssistant:
@@ -595,20 +729,20 @@ class ParallelVoiceAssistant:
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
 
-      
+
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
         force_subprocess_playback: bool = False,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
 
-      
+
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(num_workers=stt_workers, engine="vosk", sample_rate=sample_rate, vosk_model_dir=vosk_model_dir)
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
 
-        
+
         self.tts = BufferedTTS(
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
@@ -624,7 +758,7 @@ class ParallelVoiceAssistant:
         self._stt_done = threading.Event()
         self._pending_lock = threading.Lock()
 
-        
+
         self._activity_lock = threading.Lock()
         self._activity_event = threading.Event()
         self._last_voice_time = time.time()
@@ -677,7 +811,7 @@ class ParallelVoiceAssistant:
             self._last_voice_time = start_time
         self._recording_stop_time = None
 
-        
+
 
         self.recorder.start()
         self.tts.start_playback()
@@ -690,11 +824,15 @@ class ParallelVoiceAssistant:
 
         try:
 
-          
+
             while True:
                 now = time.time()
                 if max_duration is not None and now - start_time >= max_duration:
                     print(f"[MAIN] Max duration {max_duration:.1f}s reached; wrapping up.")
+
+                    self._recording_stop_time = now
+                    self.stats.recording_stop_time = now
+
                     break
 
                 with self._activity_lock:
@@ -703,6 +841,10 @@ class ParallelVoiceAssistant:
 
                 if has_voice and (now - last_voice) >= self._silence_timeout:
                     print(f"[MAIN] Detected {self._silence_timeout:.1f}s of silence; stopping recorder.")
+
+                    self._recording_stop_time = now
+                    self.stats.recording_stop_time = now
+
                     break
 
                 wait_timeout = 0.5
@@ -714,28 +856,26 @@ class ParallelVoiceAssistant:
                 if triggered:
                     self._activity_event.clear()
 
-                    
         except KeyboardInterrupt:
             print("\n[MAIN] Interrupted by user")
+            interrupt_time = time.time()
+            self._recording_stop_time = interrupt_time
+            self.stats.recording_stop_time = interrupt_time
         finally:
             self.recorder.stop()
-
-            
             stop_time = time.time()
-            self._recording_stop_time = stop_time
-            self.stats.recording_stop_time = stop_time
+            if self._recording_stop_time is None:
+                self._recording_stop_time = stop_time
+            self.stats.recording_stop_time = self._recording_stop_time
 
-      
 
         stt_thread.join(timeout=5.0)
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
 
-          
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
 
-  
             self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
@@ -761,14 +901,13 @@ class ParallelVoiceAssistant:
                     continue
 
 
-                    
+
                 if not self._is_silent_chunk(audio_chunk):
                     self._register_activity()
 
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
 
-          
                 self.stats.stt_chunks += 1
                 chunk_id += 1
 
@@ -781,12 +920,10 @@ class ParallelVoiceAssistant:
 
     def _process_stt_results(self, wait: bool) -> None:
 
-      
         pending: List[Tuple[int, Future, float]] = []
         while not self.stt_futures.empty():
             chunk_id, future, start_time = self.stt_futures.get()
 
-          
             if wait or future.done():
                 try:
                     result = future.result()
@@ -795,10 +932,8 @@ class ParallelVoiceAssistant:
                     continue
             else:
 
-              
                 pending.append((chunk_id, future, start_time))
 
-  
                 continue
 
             if not result:
@@ -825,6 +960,7 @@ class ParallelVoiceAssistant:
                 self.llm_futures.put((llm_future, llm_trigger_time, reference_time))
 
 
+
         for item in pending:
             self.stt_futures.put(item)
 
@@ -833,7 +969,7 @@ class ParallelVoiceAssistant:
         while not self._stt_done.is_set() or not self.llm_futures.empty():
             try:
 
-                llm_future, start_time, input_timestamp = self.llm_futures.get(timeout=0.5)
+                llm_future, _submit_time, reference_timestamp = self.llm_futures.get(timeout=0.5)
 
             except queue.Empty:
                 continue
@@ -849,7 +985,8 @@ class ParallelVoiceAssistant:
                 continue
 
 
-            latency = max(0.0, response_ready_time - start_time)
+            latency = max(0.0, response_ready_time - reference_timestamp)
+
             self.stats.llm_latencies.append(latency)
 
             if (
@@ -860,6 +997,14 @@ class ParallelVoiceAssistant:
                     0.0, response_ready_time - self._recording_stop_time
                 )
 
+            elif (
+                self.stats.recording_to_first_llm_latency is None
+                and self._recording_stop_time is None
+            ):
+                self.stats.recording_to_first_llm_latency = max(
+                    0.0, response_ready_time - reference_timestamp
+                )
+
 
             response = (response or "").strip()
             if not response:
@@ -867,6 +1012,7 @@ class ParallelVoiceAssistant:
 
             print(f"[LLM] Response: {response[:120]}{'...' if len(response) > 120 else ''}")
             self.stats.llm_responses += 1
+
 
 
             sentences = self._split_sentences(response)
@@ -964,6 +1110,7 @@ class ParallelVoiceAssistant:
         return sentences
 
 
+
     @staticmethod
     def _print_latency_summary(label: str, samples: List[float]) -> None:
         if not samples:
@@ -974,6 +1121,7 @@ class ParallelVoiceAssistant:
         min_val = min(samples)
         max_val = max(samples)
         print(f"{label}: avg {avg:.2f}s (min {min_val:.2f}s, max {max_val:.2f}s, n={len(samples)})")
+
 
 
     def _print_stats(self, elapsed: float) -> None:
@@ -998,6 +1146,7 @@ class ParallelVoiceAssistant:
             print("Recording -> first LLM response: n/a")
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
+
 
         print("----------------------\n")
 
@@ -1063,8 +1212,10 @@ class ModelPreloader:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
-    parser.add_argument("--duration", type=float, default=6.0, help="How long to run the streaming demo")
-    parser.add_argument("--no-warmup", action="store_true", help="Skip model warm-up steps")
+
+    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
+    parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
+
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
         "--vosk-model",
@@ -1073,7 +1224,8 @@ def _parse_args() -> argparse.Namespace:
         help="Path to Vosk model directory",
     )
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="Threads to pass to llama110")
-    parser.add_argument("--n-predict", type=int, default=96, help="Tokens to generate with llama110")
+
+    parser.add_argument("--n-predict", type=int, default=16, help="Tokens to generate with llama110")
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
     parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
     parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
@@ -1085,6 +1237,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip direct sounddevice playback and always use the playback command",
     )
+
 
     parser.add_argument(
         "--silence-timeout",
@@ -1098,6 +1251,7 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_SILENCE_THRESHOLD,
         help="RMS amplitude threshold (int16) to treat chunks as silence",
     )
+
 
     return parser.parse_args()
 
@@ -1114,7 +1268,9 @@ def main() -> None:
     if args.llama_model:
         llama_kwargs["model_path"] = str(args.llama_model)
 
-    if not args.no_warmup:
+
+    if args.warmup:
+
         ModelPreloader.warmup_vosk()
         ModelPreloader.warmup_llama(llama_kwargs)
         ModelPreloader.warmup_piper(args.piper_model)
@@ -1127,6 +1283,7 @@ def main() -> None:
         piper_model_path=args.piper_model,
         llama_kwargs=llama_kwargs,
 
+
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
         force_subprocess_playback=args.force_subprocess_playback,
@@ -1135,6 +1292,7 @@ def main() -> None:
     )
     max_duration = args.duration if args.duration and args.duration > 0 else None
     assistant.run(duration=max_duration)
+
 
 
 
