@@ -1,15 +1,19 @@
-"""High-level streaming voice assistant pipeline with async Vosk STT, llama110 LLM, and Piper TTS.
+
+"""High-level streaming voice assistant pipeline with async Whisper STT, llama110 LLM, and Piper TTS.
 
 This module consolidates the experimental streaming helpers that previously lived in
-``voice_parallel.py`` while switching the speech-to-text stage to Vosk, the language model
-stage to the ``llama110`` helper from :mod:`voice_test`, and the text-to-speech stage to
-Piper.  The design mirrors the old parallel prototype: audio is captured continuously in
+``voice_parallel.py`` while switching the speech-to-text stage to whisper.cpp, the language
+model stage to the ``llama110`` helper from :mod:`voice_test`, and the text-to-speech stage
+to Piper.  The design mirrors the old parallel prototype: audio is captured continuously in
+
 background threads, fed to an asynchronous STT worker pool, passed through a streaming LLM
 interface, and finally voiced through a buffered TTS player.
 
 The default configuration expects the following local assets:
 
-* Vosk model directory: ``~/models/vosk-model-small-en-us-0.15``
+* whisper.cpp binary: ``~/whisper.cpp/build/bin/whisper-cli``
+* Whisper model: ``~/whisper.cpp/models/ggml-tiny.bin``
+
 * ``llama.cpp`` binary and llama110 model (see :func:`voice_test.llama110`)
 * Piper voice model, defaulting to ``~/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx``
 
@@ -20,9 +24,12 @@ All components are exposed as classes so they can be reused or extended individu
 from __future__ import annotations
 
 import argparse
+
+import contextlib
 import json
 import os
 import queue
+import shutil
 import subprocess
 
 import tempfile
@@ -36,13 +43,11 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 
-
 import numpy as np
 import psutil
 import sounddevice as sd
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from vosk import KaldiRecognizer, Model as VoskModel
 
 from voice_test import llama110
 
@@ -57,11 +62,10 @@ CHUNK_DURATION = 2.0  # seconds
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
 
-
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
 
-VOSK_MODEL_DIR = Path.home() / "models" / "vosk-model-small-en-us-0.15"
+
 PIPER_MODEL_PATH = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
 
 # ================================================================
@@ -111,129 +115,61 @@ class StreamingRecorder:
             self._thread = None
 
 
-# ================================================================
-# Parallel Speech-to-Text (Vosk default, Whisper fallback)
+
+# Parallel Speech-to-Text (whisper.cpp)
+
 # ================================================================
 
 
 class ParallelSTT:
-    """Process audio chunks asynchronously using Vosk or Whisper."""
+
+    """Process audio chunks asynchronously using the whisper.cpp CLI."""
+
 
     def __init__(
         self,
         num_workers: int = 2,
-        engine: str = "vosk",
+
         sample_rate: int = SAMPLE_RATE,
-        vosk_model_dir: Path = VOSK_MODEL_DIR,
+        whisper_exe: Path = WHISPER_EXE,
+        whisper_model: Path = WHISPER_MODEL,
+        whisper_threads: Optional[int] = None,
+        emit_partials: bool = False,
     ) -> None:
         self.executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
-        self.engine = engine.lower()
         self.sample_rate = int(sample_rate)
-        self.vosk_model_dir = Path(vosk_model_dir)
+        self.whisper_exe = Path(whisper_exe)
+        self.whisper_model = Path(whisper_model)
+        self.whisper_threads = int(whisper_threads) if whisper_threads else None
+        self.emit_partials = bool(emit_partials)
 
-        self._last_partial_text = ""
-        self._filler_tokens = {"huh", "uh", "um", "hmm", "h", "uhh"}
+        self._chunks: List[bytes] = []
+        self._transcript_lock = threading.Lock()
+        self._emitted_transcript = ""
+        self._last_partial = ""
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_stt_"))
 
+        if not self.whisper_exe.exists():
+            raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
+        if not self.whisper_model.exists():
+            raise FileNotFoundError(f"Whisper model not found: {self.whisper_model}")
 
-        if self.engine == "vosk":
-            if not self.vosk_model_dir.exists():
-                raise FileNotFoundError(
-                    f"Vosk model directory not found: {self.vosk_model_dir}. "
-                    "Download the model and place it at the configured path."
-                )
-            self.vosk_model = VoskModel(str(self.vosk_model_dir))
-            self._recognizer_lock = threading.Lock()
-            self._recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
-        else:
-            self.vosk_model = None
-            self._recognizer_lock = threading.Lock()
-            self._recognizer = None
+    # --------------------- Whisper helpers -----------------------
 
-        self.whisper_exe = WHISPER_EXE
-        self.whisper_model = WHISPER_MODEL
+    def _write_wav(self, audio_bytes: bytes, prefix: str) -> Path:
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", prefix=f"{prefix}_", dir=self._temp_dir, delete=False
+        )
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        with wave.open(str(tmp_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(audio_bytes)
+        return tmp_path
 
-    # ---------------------- Vosk processing ----------------------
-
-    def _process_chunk_vosk(self, audio_chunk: np.ndarray, chunk_id: int, is_final: bool = False) -> Dict[str, Any]:
-        audio_int16 = np.ascontiguousarray(audio_chunk, dtype=np.int16)
-        audio_bytes = audio_int16.tobytes()
-
-        with self._recognizer_lock:
-            recognizer = self._recognizer
-            if recognizer is None:
-                recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
-                self._recognizer = recognizer
-
-            text = ""
-            try:
-                if recognizer.AcceptWaveform(audio_bytes):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "")
-
-                    self._last_partial_text = ""
-                else:
-                    partial = json.loads(recognizer.PartialResult())
-                    text = partial.get("partial", "")
-                    normalized = text.strip().lower()
-                    if (
-                        not normalized
-                        or normalized == self._last_partial_text
-                        or (len(normalized) < 4 and " " not in normalized)
-                        or normalized in self._filler_tokens
-                    ):
-                        text = ""
-                    else:
-                        self._last_partial_text = normalized
-
-
-                if is_final:
-                    final = json.loads(recognizer.FinalResult())
-                    final_text = final.get("text", "")
-                    if final_text:
-                        # Append any remaining text that FinalResult surfaced
-                        text = (f"{text} {final_text}" if text else final_text).strip()
-                    # Reset recognizer for the next session
-                    self._recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
-
-                    self._last_partial_text = ""
-
-            except Exception as exc:
-                print(f"[STT][Vosk] Error decoding chunk {chunk_id}: {exc}")
-                text = ""
-
-        return {"chunk_id": chunk_id, "text": text.strip(), "is_final": is_final}
-
-    def _finalize_vosk(self, chunk_id: int) -> Dict[str, Any]:
-        with self._recognizer_lock:
-            recognizer = self._recognizer
-            text = ""
-            if recognizer is not None:
-                try:
-                    final = json.loads(recognizer.FinalResult())
-                    text = final.get("text", "")
-                except Exception as exc:
-                    print(f"[STT][Vosk] Error during finalization: {exc}")
-                finally:
-                    self._recognizer = KaldiRecognizer(self.vosk_model, self.sample_rate)
-
-                    self._last_partial_text = ""
-
-        return {"chunk_id": chunk_id, "text": text.strip(), "is_final": True}
-
-    # --------------------- Whisper processing --------------------
-
-    def _process_chunk_whisper(self, audio_chunk: np.ndarray, chunk_id: int) -> Dict[str, Any]:
-        import tempfile
-
-        audio_int16 = np.ascontiguousarray(audio_chunk, dtype=np.int16)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-            wav_path = Path(tmp_wav.name)
-            with wave.open(tmp_wav, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(audio_int16.tobytes())
-
+    def _run_whisper(self, wav_path: Path, timeout: int = 60) -> str:
         cmd = [
             str(self.whisper_exe),
             "-m",
@@ -242,43 +178,110 @@ class ParallelSTT:
             str(wav_path),
             "--no-prints",
             "--output-txt",
-            "-t",
-            "2",
         ]
-        text = ""
+        if self.whisper_threads:
+            cmd += ["-t", str(self.whisper_threads)]
+
         try:
-
-            subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-            txt_path = wav_path.with_suffix(".txt")
-            alt_txt = Path(str(wav_path) + ".txt")
-            if txt_path.exists():
-                text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
-                txt_path.unlink(missing_ok=True)
-            elif alt_txt.exists():
-                text = alt_txt.read_text(encoding="utf-8", errors="ignore").strip()
-                alt_txt.unlink(missing_ok=True)
+            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print("[STT][Whisper] Transcription timed out")
+            return ""
         except Exception as exc:
-            print(f"[STT][Whisper] Error processing chunk {chunk_id}: {exc}")
+            print(f"[STT][Whisper] Error running whisper.cpp: {exc}")
+            return ""
+
+        text = ""
+        candidates = [wav_path.with_suffix(".txt"), Path(str(wav_path) + ".txt")]
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception as exc:
+                print(f"[STT][Whisper] Failed reading {candidate.name}: {exc}")
+                text = ""
+            finally:
+                candidate.unlink(missing_ok=True)
+            if text:
+                break
+
+        return text
+
+    def _process_chunk_whisper(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
+        wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
+        try:
+            text = self._run_whisper(wav_path, timeout=45)
         finally:
             wav_path.unlink(missing_ok=True)
 
+        text = (text or "").strip()
+        if not text:
+            return {"chunk_id": chunk_id, "text": "", "is_final": False}
+
+        with self._transcript_lock:
+            if text.lower() == self._last_partial.lower():
+                return {"chunk_id": chunk_id, "text": "", "is_final": False}
+            self._last_partial = text
+            self._emitted_transcript = (f"{self._emitted_transcript} {text}").strip()
+
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
+
+    def _finalize_whisper(self, chunk_id: int) -> Dict[str, Any]:
+        with self._transcript_lock:
+            chunks = list(self._chunks)
+            emitted = self._emitted_transcript.strip()
+            self._last_partial = ""
+            self._chunks.clear()
+
+        if not chunks:
+            return {"chunk_id": chunk_id, "text": "", "is_final": True}
+
+        wav_path = self._write_wav(b"".join(chunks), f"session{chunk_id}")
+        try:
+            full_text = (self._run_whisper(wav_path, timeout=120) or "").strip()
+        finally:
+            wav_path.unlink(missing_ok=True)
+
+        new_text = full_text
+        if emitted and full_text.lower().startswith(emitted.lower()):
+            new_text = full_text[len(emitted) :].strip()
+
+        with self._transcript_lock:
+            self._emitted_transcript = full_text
+
+        return {"chunk_id": chunk_id, "text": new_text, "is_final": True}
+
+    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
+        return {"chunk_id": chunk_id, "text": "", "is_final": False}
+
 
     # -------------------------- Public API -----------------------
 
     def submit_chunk(self, audio_chunk: np.ndarray, chunk_id: int) -> Future:
-        if self.engine == "vosk":
-            return self.executor.submit(self._process_chunk_vosk, audio_chunk, chunk_id, False)
-        return self.executor.submit(self._process_chunk_whisper, audio_chunk, chunk_id)
+
+        audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
+        with self._transcript_lock:
+            self._chunks.append(audio_bytes)
+
+        if not self.emit_partials:
+            return self.executor.submit(self._empty_chunk, chunk_id)
+        return self.executor.submit(self._process_chunk_whisper, audio_bytes, chunk_id)
 
     def finalize(self, chunk_id: int) -> Optional[Future]:
-        if self.engine != "vosk":
-            return None
-        return self.executor.submit(self._finalize_vosk, chunk_id)
+        return self.executor.submit(self._finalize_whisper, chunk_id)
+
+    def reset(self) -> None:
+        with self._transcript_lock:
+            self._chunks.clear()
+            self._emitted_transcript = ""
+            self._last_partial = ""
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
+        with contextlib.suppress(Exception):
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+
 
 
 # ================================================================
@@ -293,6 +296,11 @@ class StreamingLLM:
         self.context_buffer: List[str] = []
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.llama_kwargs = llama_kwargs or {}
+
+        self.llama_kwargs.setdefault("n_predict", 12)
+        self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
+        self.llama_kwargs.setdefault("temperature", 0.2)
+
 
     def process_incremental(self, text_chunk: str, is_final: bool = False) -> Optional[Future]:
         chunk = (text_chunk or "").strip()
@@ -327,9 +335,11 @@ class StreamingLLM:
         call_kwargs = {
             "llama_cli_path": self.llama_kwargs.get("llama_cli_path"),
             "model_path": self.llama_kwargs.get("model_path"),
-            "n_predict": self.llama_kwargs.get("n_predict", 96),
+
+            "n_predict": self.llama_kwargs.get("n_predict", 12),
             "threads": self.llama_kwargs.get("threads", os.cpu_count() or 4),
-            "temperature": self.llama_kwargs.get("temperature", 0.3),
+            "temperature": self.llama_kwargs.get("temperature", 0.2),
+
             "sampler": self.llama_kwargs.get("sampler"),
             "tts_after": False,
             "tts_cmd": None,
@@ -349,7 +359,24 @@ class StreamingLLM:
         if not response:
             fallback = (result or {}).get("raw_stdout") or ""
             response = fallback.strip()
-        return response.strip()
+
+        return self._clean_response(response)
+
+    @staticmethod
+    def _clean_response(response: str) -> str:
+        text = (response or "").strip()
+        leading_quotes = ('"', "'", "`", "“", "”", "‘", "’")
+        while text and text[0] in leading_quotes:
+            text = text[1:].lstrip()
+        if text.startswith("?"):
+            # Strip leading question mark artifacts such as ?" or ? 'Hello'
+            trimmed = text[1:].lstrip()
+            if trimmed and trimmed[0].isalpha():
+                text = trimmed
+        if text.startswith("\"") and len(text) > 1:
+            text = text[1:].lstrip()
+        return text
+
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
@@ -430,7 +457,6 @@ class BufferedTTS:
             self.output_device = output_device
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
-
 
         self._playback_env = os.environ.copy()
         if isinstance(self.output_device, str):
@@ -619,7 +645,6 @@ class BufferedTTS:
             print(f"[TTS] Piper model not found: {self.model_path}")
             return None
 
-
         info = self._voice_info
         cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
         if info.sample_rate:
@@ -688,7 +713,6 @@ class BufferedTTS:
 
 @dataclass
 
-
 class PendingOutput:
     timestamp: float
     segments_expected: int
@@ -697,14 +721,12 @@ class PendingOutput:
 
 @dataclass
 
-
 class PipelineStats:
     stt_chunks: int = 0
     llm_responses: int = 0
     tts_segments: int = 0
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
-
 
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
@@ -725,10 +747,13 @@ class ParallelVoiceAssistant:
         chunk_duration: float = CHUNK_DURATION,
         sample_rate: int = SAMPLE_RATE,
         stt_workers: int = 2,
-        vosk_model_dir: Path = VOSK_MODEL_DIR,
+
+        whisper_exe: Path = WHISPER_EXE,
+        whisper_model: Path = WHISPER_MODEL,
+        whisper_threads: Optional[int] = None,
+        emit_stt_partials: bool = False,
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
-
 
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
@@ -736,12 +761,17 @@ class ParallelVoiceAssistant:
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
 
-
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
-        self.stt = ParallelSTT(num_workers=stt_workers, engine="vosk", sample_rate=sample_rate, vosk_model_dir=vosk_model_dir)
+        self.stt = ParallelSTT(
+            num_workers=stt_workers,
+            sample_rate=sample_rate,
+            whisper_exe=whisper_exe,
+            whisper_model=whisper_model,
+            whisper_threads=whisper_threads,
+            emit_partials=emit_stt_partials,
+        )
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
-
 
         self.tts = BufferedTTS(
             model_path=piper_model_path,
@@ -757,7 +787,6 @@ class ParallelVoiceAssistant:
         self.stats = PipelineStats()
         self._stt_done = threading.Event()
         self._pending_lock = threading.Lock()
-
 
         self._activity_lock = threading.Lock()
         self._activity_event = threading.Event()
@@ -812,7 +841,6 @@ class ParallelVoiceAssistant:
         self._recording_stop_time = None
 
 
-
         self.recorder.start()
         self.tts.start_playback()
 
@@ -823,7 +851,6 @@ class ParallelVoiceAssistant:
         llm_thread.start()
 
         try:
-
 
             while True:
                 now = time.time()
@@ -868,7 +895,6 @@ class ParallelVoiceAssistant:
                 self._recording_stop_time = stop_time
             self.stats.recording_stop_time = self._recording_stop_time
 
-
         stt_thread.join(timeout=5.0)
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
@@ -899,7 +925,6 @@ class ParallelVoiceAssistant:
                 if audio_chunk is None:
                     self._process_stt_results(wait=False)
                     continue
-
 
 
                 if not self._is_silent_chunk(audio_chunk):
@@ -960,7 +985,6 @@ class ParallelVoiceAssistant:
                 self.llm_futures.put((llm_future, llm_trigger_time, reference_time))
 
 
-
         for item in pending:
             self.stt_futures.put(item)
 
@@ -1014,7 +1038,6 @@ class ParallelVoiceAssistant:
             self.stats.llm_responses += 1
 
 
-
             sentences = self._split_sentences(response)
             if not sentences:
                 sentences = [response]
@@ -1032,7 +1055,7 @@ class ParallelVoiceAssistant:
                 continue
 
 
-            pending_timestamp = self._reference_timestamp_for_output(input_timestamp)
+            pending_timestamp = self._reference_timestamp_for_output(reference_timestamp)
             pending = PendingOutput(timestamp=pending_timestamp, segments_expected=len(tts_jobs))
 
             with self._pending_lock:
@@ -1110,7 +1133,6 @@ class ParallelVoiceAssistant:
         return sentences
 
 
-
     @staticmethod
     def _print_latency_summary(label: str, samples: List[float]) -> None:
         if not samples:
@@ -1121,7 +1143,6 @@ class ParallelVoiceAssistant:
         min_val = min(samples)
         max_val = max(samples)
         print(f"{label}: avg {avg:.2f}s (min {min_val:.2f}s, max {max_val:.2f}s, n={len(samples)})")
-
 
 
     def _print_stats(self, elapsed: float) -> None:
@@ -1147,7 +1168,6 @@ class ParallelVoiceAssistant:
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
-
         print("----------------------\n")
 
 
@@ -1160,13 +1180,51 @@ class ModelPreloader:
     """Utility helpers to warm up the local models so first inference is faster."""
 
     @staticmethod
-    def warmup_vosk(sample_rate: int = SAMPLE_RATE) -> None:
-        print("[WARMUP] Loading Vosk model...")
-        model = VoskModel(str(VOSK_MODEL_DIR))
-        recognizer = KaldiRecognizer(model, sample_rate)
-        recognizer.AcceptWaveform(b"\x00" * sample_rate)  # 1 second of silence
-        recognizer.FinalResult()
-        print("[WARMUP] Vosk ready")
+
+    def warmup_whisper(
+        whisper_exe: Path = WHISPER_EXE,
+        whisper_model: Path = WHISPER_MODEL,
+        sample_rate: int = SAMPLE_RATE,
+    ) -> None:
+        print("[WARMUP] Priming whisper.cpp...")
+        exe = Path(whisper_exe)
+        model = Path(whisper_model)
+        if not exe.exists():
+            print(f"[WARMUP] Whisper binary missing at {exe}")
+            return
+        if not model.exists():
+            print(f"[WARMUP] Whisper model missing at {model}")
+            return
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="whisper_warmup_"))
+        wav_path = tmp_dir / "warmup.wav"
+        success = True
+        try:
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(b"\x00" * sample_rate)
+            cmd = [
+                str(exe),
+                "-m",
+                str(model),
+                "-f",
+                str(wav_path),
+                "--no-prints",
+                "--output-txt",
+                "-t",
+                "1",
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=30)
+        except Exception as exc:
+            print(f"[WARMUP] Whisper warm-up failed: {exc}")
+            success = False
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if success:
+            print("[WARMUP] whisper.cpp ready")
+
 
     @staticmethod
     def warmup_llama(llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
@@ -1215,17 +1273,27 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
     parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
-
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
-        "--vosk-model",
+        "--whisper-cli",
         type=Path,
-        default=VOSK_MODEL_DIR,
-        help="Path to Vosk model directory",
+        default=WHISPER_EXE,
+        help="Path to whisper.cpp CLI binary",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        type=Path,
+        default=WHISPER_MODEL,
+        help="Path to whisper.cpp model",
+    )
+    parser.add_argument(
+        "--whisper-threads",
+        type=int,
+        default=os.cpu_count() or 2,
+        help="Threads to dedicate to whisper.cpp",
     )
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="Threads to pass to llama110")
-
-    parser.add_argument("--n-predict", type=int, default=16, help="Tokens to generate with llama110")
+    parser.add_argument("--n-predict", type=int, default=12, help="Tokens to generate with llama110")
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
     parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
     parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
@@ -1237,7 +1305,6 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip direct sounddevice playback and always use the playback command",
     )
-
 
     parser.add_argument(
         "--silence-timeout",
@@ -1252,6 +1319,11 @@ def _parse_args() -> argparse.Namespace:
         help="RMS amplitude threshold (int16) to treat chunks as silence",
     )
 
+    parser.add_argument(
+        "--enable-stt-partials",
+        action="store_true",
+        help="Run whisper.cpp on each chunk for incremental transcripts",
+    )
 
     return parser.parse_args()
 
@@ -1270,8 +1342,8 @@ def main() -> None:
 
 
     if args.warmup:
+        ModelPreloader.warmup_whisper(args.whisper_cli, args.whisper_model)
 
-        ModelPreloader.warmup_vosk()
         ModelPreloader.warmup_llama(llama_kwargs)
         ModelPreloader.warmup_piper(args.piper_model)
 
@@ -1279,10 +1351,13 @@ def main() -> None:
         chunk_duration=CHUNK_DURATION,
         sample_rate=SAMPLE_RATE,
         stt_workers=2,
-        vosk_model_dir=args.vosk_model,
+
+        whisper_exe=args.whisper_cli,
+        whisper_model=args.whisper_model,
+        whisper_threads=args.whisper_threads,
+        emit_stt_partials=args.enable_stt_partials,
         piper_model_path=args.piper_model,
         llama_kwargs=llama_kwargs,
-
 
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
@@ -1292,7 +1367,6 @@ def main() -> None:
     )
     max_duration = args.duration if args.duration and args.duration > 0 else None
     assistant.run(duration=max_duration)
-
 
 
 
