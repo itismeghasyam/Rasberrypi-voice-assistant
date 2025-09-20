@@ -51,7 +51,7 @@ from voice_test import llama110
 PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 2.0  # seconds
+CHUNK_DURATION = 3.0  # seconds
 
 
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
@@ -343,7 +343,7 @@ class BufferedTTS:
         self,
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
-        timeout: int = 30,
+        timeout: int = 6,
 
       
         output_device: Optional[Any] = None,
@@ -507,16 +507,22 @@ class BufferedTTS:
             print(f"[TTS] Piper model not found: {self.model_path}")
             return None
 
-        output_file = Path(f"/tmp/tts_segment_{segment_id}.wav")
+        output_file = Path(f"{PROJECT_DIR}/{segment_id}.wav")
         cmd = [
             "piper",
-            "-m",
-            str(self.model_path),
-            "--output_file",
-            str(output_file),
+            "-m", str(self.model_path),
+            "--output-raw"
         ]
         try:
             subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=self.timeout)
+            proc = subprocess.Popen(
+            ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
+            stdin=subprocess.PIPE)
+            
+            piper_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=proc.stdin)
+            piper_proc.communicate(input=text.encode("utf-8"))
+            
+            
             self.speech_queue.put(str(output_file))
             return str(output_file)
         except subprocess.CalledProcessError as exc:
@@ -1057,7 +1063,7 @@ class ModelPreloader:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
-    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
+    parser.add_argument("--duration", type=float, default=6.0, help="How long to run the streaming demo")
     parser.add_argument("--no-warmup", action="store_true", help="Skip model warm-up steps")
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
