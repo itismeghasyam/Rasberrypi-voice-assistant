@@ -1098,8 +1098,10 @@ class ParallelVoiceAssistant:
                         rms = 0.0
                     print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
                 else:
-                    self._register_activity()
-                    self._consecutive_silent_chunks = 0
+                    # Defer activity tracking until Whisper confirms actual text for
+                    # this chunk. High-energy noise without a transcript shouldn't
+                    # refresh the silence timeout window.
+                    pass
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
@@ -1173,7 +1175,6 @@ class ParallelVoiceAssistant:
                     print(
                         f"[STT] Chunk {res_chunk_id}: (speech detected, awaiting transcription)"
                     )
-                    self._consecutive_silent_chunks = 0
 
                     self._awaiting_transcript_chunks += 1
                     if self._awaiting_transcript_started_at is None:
