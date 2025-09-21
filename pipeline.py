@@ -24,7 +24,7 @@ import psutil
 import sounddevice as sd
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from voice_test import llama110
+from voice_test import llama110, transcribe_audio
 
 # ================================================================
 # Configuration
@@ -120,8 +120,37 @@ class ParallelSTT:
         return self.executor.submit(self._run_whisper, audio_chunk, chunk_id)
 
     def _run_whisper(self, audio_chunk: np.ndarray, chunk_id: int) -> Dict[str, Any]:
-        # Placeholder implementation; replace with real whisper invocation.
-        return {"text": "", "is_final": True, "chunk_id": chunk_id}
+        """Run whisper.cpp on the provided audio chunk and return the transcript."""
+
+        tmp_path: Optional[Path] = None
+        try:
+            chunk = np.asarray(audio_chunk, dtype=np.int16)
+            if chunk.ndim > 1:
+                chunk = chunk.reshape(-1)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+
+            with wave.open(str(tmp_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(chunk.tobytes())
+
+            text = transcribe_audio(tmp_path)
+            clean_text = (text or "").strip()
+            return {"text": clean_text, "is_final": True, "chunk_id": chunk_id}
+        except Exception as exc:
+            print(f"[STT] Whisper processing failed for chunk {chunk_id}: {exc}")
+            return {"text": "", "is_final": True, "chunk_id": chunk_id}
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink(missing_ok=True)
+                with contextlib.suppress(Exception):
+                    tmp_path.with_suffix(".txt").unlink(missing_ok=True)
+                with contextlib.suppress(Exception):
+                    Path(str(tmp_path) + ".txt").unlink(missing_ok=True)
 
     def finalize(self, next_chunk_id: int) -> Optional[Future]:
         return None
@@ -137,9 +166,39 @@ class ParallelSTT:
 class StreamingLLM:
     def __init__(self, llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self._llama_kwargs = llama_kwargs or {}
+        self._buffer: List[str] = []
+        self._buffer_lock = threading.Lock()
 
     def process_incremental(self, text: str, is_final: bool = False) -> Optional[Future]:
-        return self.executor.submit(lambda: "")
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return None
+
+        with self._buffer_lock:
+            self._buffer.append(cleaned)
+            if not is_final:
+                return None
+
+            prompt = " ".join(self._buffer)
+            self._buffer.clear()
+
+        return self.executor.submit(self._run_llama, prompt)
+
+    def _run_llama(self, prompt: str) -> str:
+        try:
+            result = llama110(prompt, **self._llama_kwargs)
+        except FileNotFoundError as exc:
+            print(f"[LLM] llama-cli not available: {exc}")
+            return ""
+        except Exception as exc:
+            print(f"[LLM] llama110 failed: {exc}")
+            return ""
+
+        if isinstance(result, dict):
+            return (result.get("generated") or "").strip()
+
+        return str(result or "").strip()
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
@@ -651,7 +710,7 @@ class ParallelVoiceAssistant:
                     is_noise = True
 
             if is_noise or not normalized:
-                if had_activity and not normalized:
+                if had_activity and not normalized and not is_final:
                     # Speech energy was observed for this chunk, but Whisper did not
                     # return any transcript yet. Treat as ongoing speech so we don't
                     # prematurely trigger silence handling.
