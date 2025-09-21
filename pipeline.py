@@ -798,6 +798,15 @@ class ParallelVoiceAssistant:
                     self.stats.pending_outputs.popleft()
                 else:
                     break
+    def _on_tts_playback_error(self) -> None:
+        """Called by the TTS layer when playback fails."""
+        print("[TTS] Playback error reported")
+        # Optional: mark pending outputs as failed, notify, or decrement counters.
+        # Keep it simple so missing handler doesn't crash the program.
+        with self._pending_lock:
+            # If you want to remove any completed pending outputs, you can do that here.
+            pass
+
 
     def _split_sentences(self, text: str) -> List[str]:
         # naive sentence splitter
