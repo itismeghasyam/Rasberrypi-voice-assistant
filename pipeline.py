@@ -1,25 +1,4 @@
-
-"""High-level streaming voice assistant pipeline with async Whisper STT, llama110 LLM, and Piper TTS.
-
-This module consolidates the experimental streaming helpers that previously lived in
-``voice_parallel.py`` while switching the speech-to-text stage to whisper.cpp, the language
-model stage to the ``llama110`` helper from :mod:`voice_test`, and the text-to-speech stage
-to Piper.  The design mirrors the old parallel prototype: audio is captured continuously in
-
-background threads, fed to an asynchronous STT worker pool, passed through a streaming LLM
-interface, and finally voiced through a buffered TTS player.
-
-The default configuration expects the following local assets:
-
-* whisper.cpp binary: ``~/whisper.cpp/build/bin/whisper-cli``
-* Whisper model: ``~/whisper.cpp/models/ggml-tiny.bin``
-
-* ``llama.cpp`` binary and llama110 model (see :func:`voice_test.llama110`)
-* Piper voice model, defaulting to ``~/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx``
-
-All components are exposed as classes so they can be reused or extended individually.  Run
-``python pipeline.py --help`` for a small CLI wrapper around :class:`ParallelVoiceAssistant`.
-"""
+import re
 
 from __future__ import annotations
 
@@ -61,7 +40,7 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 2.0  # seconds
 
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
-DEFAULT_SILENCE_THRESHOLD = 900.0  # RMS amplitude threshold for silence detection
+DEFAULT_SILENCE_THRESHOLD = 700.0  # RMS amplitude threshold for silence detection
 
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
@@ -298,7 +277,7 @@ class StreamingLLM:
 
         self.llama_kwargs.setdefault("n_predict", 12)
         self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
-        self.llama_kwargs.setdefault("temperature", 0.2)
+        self.llama_kwargs.setdefault("temperature", 0.6)
 
     def process_incremental(self, text_chunk: str, is_final: bool = False) -> Optional[Future]:
         chunk = (text_chunk or "").strip()
@@ -336,7 +315,7 @@ class StreamingLLM:
 
             "n_predict": self.llama_kwargs.get("n_predict", 12),
             "threads": self.llama_kwargs.get("threads", os.cpu_count() or 4),
-            "temperature": self.llama_kwargs.get("temperature", 0.2),
+            "temperature": self.llama_kwargs.get("temperature", 0.6),
 
             "sampler": self.llama_kwargs.get("sampler"),
             "tts_after": False,
@@ -758,6 +737,8 @@ class ParallelVoiceAssistant:
         use_subprocess_playback: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        
+        
 
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
@@ -802,6 +783,21 @@ class ParallelVoiceAssistant:
         self._stop_reason: Optional[str] = None
         self._consecutive_silent_chunks = 0
         self._silent_chunks_before_stop = 2
+        
+        self._noise_blacklist = {
+            "wind blowing",
+            "bird chirping",
+            "blank_audio",
+            "blank audio",
+            "[blank_audio]",
+            "(wind blowing)",
+            "(bird chirping)",
+        }
+
+        # optional: regex to catch bracket/parenthesis or small variations
+        self._noise_regex = re.compile(
+            r"\b(blank[_ ]?audio|wind blowing|bird chirping)\b", flags=re.IGNORECASE
+        )
 
 
     def _register_activity(self) -> None:
@@ -1024,12 +1020,31 @@ class ParallelVoiceAssistant:
             is_final = bool(result.get("is_final"))
             res_chunk_id = result.get("chunk_id", chunk_id)
 
-            if text:
+            # Normalize for noise checks
+            normalized = (text or "").strip().lower()
 
-                self._register_activity()
-                self._consecutive_silent_chunks = 0
+            # Check blacklist exact matches first, then regex for variants
+            is_noise = False
+            if normalized:
+                if normalized in self._noise_blacklist:
+                    is_noise = True
+                elif self._noise_regex.search(normalized):
+                    is_noise = True
+
+            if is_noise or not normalized:
+                # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
+                print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
+                self._handle_silent_audio_chunk()
+                # We still want to surface the log, but skip registering activity and LLM trigger
+                # continue to next future
+                continue
+
+            # Otherwise it's valid speech
+            self._register_activity()
+            self._consecutive_silent_chunks = 0
 
             print(f"[STT] Chunk {res_chunk_id}: {text}")
+
 
 
             llm_trigger_time = time.time()
