@@ -410,12 +410,10 @@ class BufferedTTS:
         else:
             self.playback_cmd = [
                 "aplay",
-                "-r",
-                str(self._voice_info.sample_rate),
-                "-f",
-                "S16_LE",
-                "-t",
-                "raw",
+                "-q",
+                "-r", str(self._voice_info.sample_rate),
+                "-f","S16_LE",
+                "-t","raw",
                 "-",
             ]
 
@@ -596,9 +594,20 @@ class BufferedTTS:
                 resolved = [str(part).replace("{file}", segment.path) for part in cmd]
                 subprocess.run(resolved, check=True, env=self._playback_env)
             elif cmd and cmd[-1] == "-" and segment.raw is not None:
-                subprocess.run(cmd, input=segment.raw, check=True, env=self._playback_env)
+                subprocess.run(
+                    cmd,
+                    input=segment.raw,
+                    check=True,
+                    env=self._playback_env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
             else:
-                subprocess.run(cmd + [segment.path], check=True, env=self._playback_env)
+                subprocess.run(cmd + [segment.path],
+                               check=True,
+                               env=self._playback_env,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL
+                               )
             return True
         except subprocess.CalledProcessError as exc:
             print(f"[TTS] Subprocess playback failed (exit {exc.returncode}) for {segment.path}: {exc}")
@@ -990,10 +999,9 @@ class ParallelVoiceAssistant:
                     except Exception:
                         rms = 0.0
                     print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
-                else:
+                    
                     # we saw energy; reset consecutive silent counter and register activity
-                    self._consecutive_silent_chunks = 0
-                    self._register_activity()
+    
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
@@ -1204,6 +1212,11 @@ class ParallelVoiceAssistant:
                 if pending.segments_expected == 0:
                     self.stats.pending_outputs.popleft()
                 break
+        try:
+            if getattr(self, "recorder", None) and getattr(self.recorder, "recording", False):
+                self._request_stop("[MAIN] Stopping recorder during TTS to avoid feedback.")
+        except Exception as e:
+            self._log(f"[TTS] playback_start hook error: {e}")
 
     def _on_tts_playback_error(self) -> None:
         with self._pending_lock:
