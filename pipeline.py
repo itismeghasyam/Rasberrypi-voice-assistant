@@ -58,10 +58,10 @@ PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 
-CHUNK_DURATION = 3.0  # seconds
+CHUNK_DURATION = 2.0  # seconds
 
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
-DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
+DEFAULT_SILENCE_THRESHOLD = 900.0  # RMS amplitude threshold for silence detection
 
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
