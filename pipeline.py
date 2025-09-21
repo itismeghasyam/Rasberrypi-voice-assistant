@@ -6,6 +6,7 @@ import argparse
 
 import contextlib
 import json
+import math
 import os
 import queue
 import shutil
@@ -19,7 +20,7 @@ import wave
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 
 import numpy as np
@@ -85,6 +86,15 @@ class StreamingRecorder:
             return self.chunk_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def clear_queue(self) -> None:
+        """Remove any queued audio chunks without blocking."""
+
+        try:
+            while True:
+                self.chunk_queue.get_nowait()
+        except queue.Empty:
+            return
 
     def stop(self) -> None:
         """Signal the recorder to stop and wait for the background thread."""
@@ -206,7 +216,7 @@ class ParallelSTT:
 
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
 
-    def _finalize_whisper(self, chunk_id: int) -> Dict[str, Any]:
+    def _finalize_whisper(self, chunk_id: int, mark_final: bool) -> Dict[str, Any]:
         with self._transcript_lock:
             chunks = list(self._chunks)
             emitted = self._emitted_transcript.strip()
@@ -229,7 +239,7 @@ class ParallelSTT:
         with self._transcript_lock:
             self._emitted_transcript = full_text
 
-        return {"chunk_id": chunk_id, "text": new_text, "is_final": True}
+        return {"chunk_id": chunk_id, "text": new_text, "is_final": mark_final}
 
     def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
         return {"chunk_id": chunk_id, "text": "", "is_final": False}
@@ -247,8 +257,8 @@ class ParallelSTT:
             return self.executor.submit(self._empty_chunk, chunk_id)
         return self.executor.submit(self._process_chunk_whisper, audio_bytes, chunk_id)
 
-    def finalize(self, chunk_id: int) -> Optional[Future]:
-        return self.executor.submit(self._finalize_whisper, chunk_id)
+    def finalize(self, chunk_id: int, mark_final: bool = True) -> Optional[Future]:
+        return self.executor.submit(self._finalize_whisper, chunk_id, mark_final)
 
     def reset(self) -> None:
         with self._transcript_lock:
@@ -372,6 +382,7 @@ class SpeechSegment:
     sample_rate: int
     channels: int = 1
     sampwidth: int = 2
+    text: str = ""
 
 
 @dataclass
@@ -610,7 +621,7 @@ class BufferedTTS:
 
 
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
-        clean_text = (text or "").strip()
+        clean_text = " ".join((text or "").split())
         if not clean_text:
             return None
         return self.executor.submit(self._generate_speech, clean_text, segment_id)
@@ -622,10 +633,17 @@ class BufferedTTS:
             print(f"[TTS] Piper model not found: {self.model_path}")
             return None
 
+        utterance = " ".join((text or "").split())
+        if not utterance:
+            return None
+
         info = self._voice_info
         cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
-        if info.sample_rate:
-            cmd += ["--sample-rate", str(info.sample_rate)]
+        # Piper streams raw 16-bit PCM on stdout when --output-raw is used. We don't
+        # override the model's configured sample rate via CLI flags because some
+        # Piper builds don't accept those options and may echo them as text. The
+        # returned PCM is still generated at the voice's native sample rate, which
+        # we honour when creating the temporary WAV container below.
         if info.speaker_id is not None:
             cmd += ["--speaker", str(info.speaker_id)]
 
@@ -633,14 +651,22 @@ class BufferedTTS:
             tmp_path = Path(tmp_file.name)
         keep_file = False
         try:
+            input_bytes = (utterance + "\n").encode("utf-8")
             proc = subprocess.run(
                 cmd,
-                input=text.encode("utf-8"),
+                input=input_bytes,
                 capture_output=True,
                 check=True,
                 timeout=self.timeout,
             )
             audio_bytes = proc.stdout
+            if self._looks_like_text(audio_bytes):
+                preview = audio_bytes[:120].decode("utf-8", errors="replace")
+                print(
+                    "[TTS] Piper returned textual output instead of audio; "
+                    f"got: {preview!r}"
+                )
+                return None
             if not audio_bytes:
                 print("[TTS] Piper returned no audio data")
                 return None
@@ -652,11 +678,13 @@ class BufferedTTS:
                 wf.writeframes(audio_bytes)
             keep_file = True
 
+            sample_rate = info.sample_rate or 22050
             segment = SpeechSegment(
                 path=str(tmp_path),
                 raw=audio_bytes,
-                sample_rate=info.sample_rate or 22050,
+                sample_rate=sample_rate,
                 channels=info.channels or 1,
+                text=utterance,
             )
             self.speech_queue.put(segment)
             return segment
@@ -674,6 +702,19 @@ class BufferedTTS:
                 except OSError:
                     pass
         return None
+
+    @staticmethod
+    def _looks_like_text(payload: bytes) -> bool:
+        """Heuristic check to detect when Piper prints text instead of PCM."""
+
+        if not payload:
+            return False
+
+        sample = payload[:64]
+        printable = sum(32 <= b <= 126 or b in (9, 10, 13) for b in sample)
+        # Random PCM rarely decodes into predominantly printable ASCII. Treat a
+        # mostly printable prefix as an indication that Piper emitted text/logs.
+        return printable >= max(10, len(sample) * 0.6)
 
     def stop(self) -> None:
         self.playing = False
@@ -742,6 +783,7 @@ class ParallelVoiceAssistant:
         
 
     ) -> None:
+        self._chunk_duration = float(chunk_duration)
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(
             num_workers=stt_workers,
@@ -776,6 +818,7 @@ class ParallelVoiceAssistant:
         self._activity_event = threading.Event()
         self._last_voice_time = time.time()
         self._has_detected_speech = False
+        self._first_voice_time: Optional[float] = None
         self._recording_stop_time: Optional[float] = None
         self._silence_timeout = float(silence_timeout)
         self._silence_threshold = float(silence_threshold)
@@ -800,12 +843,57 @@ class ParallelVoiceAssistant:
             r"\b(blank[_ ]?audio|wind blowing|bird chirping)\b", flags=re.IGNORECASE
         )
 
+        self._tts_futures_lock = threading.Lock()
+        self._pending_tts_futures: Set[Future] = set()
+        self._chunk_activity: Dict[int, bool] = {}
+        self._awaiting_transcript_chunks = 0
+        self._awaiting_transcript_started_at: Optional[float] = None
+        self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(4.0 / max(0.1, self._chunk_duration))))
+        self._awaiting_transcript_timeout = max(3.0, self._chunk_duration * 2.5)
+        self._stt_flush_in_progress = False
+        self._next_finalize_id = 1_000_000
+        self._active_flush_ids: Set[int] = set()
+
 
     def _register_activity(self) -> None:
+        now = time.time()
         with self._activity_lock:
+            if not self._has_detected_speech:
+                self._first_voice_time = now
             self._has_detected_speech = True
-            self._last_voice_time = time.time()
+            self._last_voice_time = now
         self._activity_event.set()
+
+    def _reset_awaiting_transcript_state(self) -> None:
+        self._awaiting_transcript_chunks = 0
+        self._awaiting_transcript_started_at = None
+
+    def _should_force_intermediate_transcription(self) -> bool:
+        if self._stt_flush_in_progress:
+            return False
+        if self._awaiting_transcript_chunks >= self._awaiting_transcript_chunk_limit:
+            return True
+        if self._awaiting_transcript_started_at is not None:
+            elapsed = time.time() - self._awaiting_transcript_started_at
+            if elapsed >= self._awaiting_transcript_timeout:
+                return True
+        return False
+
+    def _queue_intermediate_transcription(self, reason: str) -> None:
+        if self._stt_flush_in_progress:
+            return
+
+        flush_id = self._next_finalize_id
+        future = self.stt.finalize(flush_id, mark_final=False)
+        if future is None:
+            return
+
+        self._stt_flush_in_progress = True
+        self._active_flush_ids.add(flush_id)
+        self.stt_futures.put((flush_id, future, time.time()))
+        print(reason)
+        self._reset_awaiting_transcript_state()
+        self._next_finalize_id += 1
 
     def _is_silent_chunk(self, audio_chunk: np.ndarray) -> bool:
         if audio_chunk.size == 0:
@@ -829,6 +917,7 @@ class ParallelVoiceAssistant:
             self.stats.recording_stop_time = self._recording_stop_time
         print(reason)
         self.recorder.stop()
+        self.recorder.clear_queue()
         self._activity_event.set()
 
     def _handle_silent_audio_chunk(self) -> None:
@@ -878,12 +967,20 @@ class ParallelVoiceAssistant:
         with self._activity_lock:
             self._has_detected_speech = False
             self._last_voice_time = start_time
+            self._first_voice_time = None
         self._recording_stop_time = None
+
+        with self._tts_futures_lock:
+            self._pending_tts_futures.clear()
 
         with self._stop_lock:
             self._stop_requested = False
             self._stop_reason = None
         self._consecutive_silent_chunks = 0
+        self._reset_awaiting_transcript_state()
+        self._stt_flush_in_progress = False
+        self._active_flush_ids.clear()
+        self._next_finalize_id = 1_000_000
 
 
         self.recorder.start()
@@ -954,6 +1051,7 @@ class ParallelVoiceAssistant:
 
         self.stt.shutdown()
         self.llm.shutdown()
+        self._wait_for_tts_completion()
         self.tts.stop()
 
         elapsed = time.time() - start_time
@@ -970,6 +1068,11 @@ class ParallelVoiceAssistant:
                     self._process_stt_results(wait=False)
                     continue
 
+                if self._stop_requested and not self.recorder.recording:
+                    self.recorder.clear_queue()
+                    self._process_stt_results(wait=False)
+                    break
+
                 # remember recorder sample rate for VAD logic if needed
                 setattr(self, "_recorder_sample_rate", self.recorder.sample_rate)
 
@@ -978,6 +1081,7 @@ class ParallelVoiceAssistant:
                 # only count a chunk as "silent" once the model actually returns nothing
                 # useful for that chunk (avoids double-counting).
                 is_silent = self._is_silent_chunk(audio_chunk)
+                self._chunk_activity[chunk_id] = not is_silent
                 if is_silent:
                     # don't mark stop here; just log and continue to submit to STT so
                     # the model can confirm whether it's empty/noise
@@ -991,9 +1095,9 @@ class ParallelVoiceAssistant:
                     except Exception:
                         rms = 0.0
                     print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
-                    
-                    # we saw energy; reset consecutive silent counter and register activity
-    
+                else:
+                    self._register_activity()
+                    self._consecutive_silent_chunks = 0
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
@@ -1031,6 +1135,12 @@ class ParallelVoiceAssistant:
             if not result:
                 continue
 
+            res_chunk_id = result.get("chunk_id", chunk_id)
+            if chunk_id in self._active_flush_ids or res_chunk_id in self._active_flush_ids:
+                self._active_flush_ids.discard(chunk_id)
+                self._active_flush_ids.discard(res_chunk_id)
+                self._stt_flush_in_progress = False
+
 
             latency = max(0.0, time.time() - start_time)
             self.stats.stt_latencies.append(latency)
@@ -1038,10 +1148,10 @@ class ParallelVoiceAssistant:
 
             text = (result.get("text") or "").strip()
             is_final = bool(result.get("is_final"))
-            res_chunk_id = result.get("chunk_id", chunk_id)
 
             # Normalize for noise checks
             normalized = (text or "").strip().lower()
+            had_activity = self._chunk_activity.pop(res_chunk_id, False)
 
             # Check blacklist exact matches first, then regex for variants
             is_noise = False
@@ -1052,14 +1162,36 @@ class ParallelVoiceAssistant:
                     is_noise = True
 
             if is_noise or not normalized:
+                if had_activity and not normalized:
+                    # Speech energy was observed for this chunk, but Whisper did not
+                    # return any transcript yet. Treat as ongoing speech for a short
+                    # period, but force an intermediate transcription if it persists.
+                    print(
+                        f"[STT] Chunk {res_chunk_id}: (speech detected, awaiting transcription)"
+                    )
+                    self._consecutive_silent_chunks = 0
+                    self._awaiting_transcript_chunks += 1
+                    if self._awaiting_transcript_started_at is None:
+                        self._awaiting_transcript_started_at = time.time()
+                    if self._should_force_intermediate_transcription():
+                        elapsed = 0.0
+                        if self._awaiting_transcript_started_at is not None:
+                            elapsed = time.time() - self._awaiting_transcript_started_at
+                        self._queue_intermediate_transcription(
+                            f"[STT] Forcing intermediate transcription after {elapsed:.1f}s without text"
+                        )
+                    continue
+
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
+                self._reset_awaiting_transcript_state()
                 self._handle_silent_audio_chunk()
                 # We still want to surface the log, but skip registering activity and LLM trigger
                 # continue to next future
                 continue
 
             # Otherwise it's valid speech
+            self._reset_awaiting_transcript_state()
             self._register_activity()
             self._consecutive_silent_chunks = 0
 
@@ -1102,21 +1234,23 @@ class ParallelVoiceAssistant:
 
             self.stats.llm_latencies.append(latency)
 
-            if (
-                self.stats.recording_to_first_llm_latency is None
-                and self._recording_stop_time is not None
-            ):
-                self.stats.recording_to_first_llm_latency = max(
-                    0.0, response_ready_time - self._recording_stop_time
-                )
+            if self.stats.recording_to_first_llm_latency is None:
+                first_voice_time: Optional[float]
+                with self._activity_lock:
+                    first_voice_time = self._first_voice_time
 
-            elif (
-                self.stats.recording_to_first_llm_latency is None
-                and self._recording_stop_time is None
-            ):
-                self.stats.recording_to_first_llm_latency = max(
-                    0.0, response_ready_time - reference_timestamp
-                )
+                if first_voice_time is not None:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - first_voice_time
+                    )
+                elif self._recording_stop_time is not None:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - self._recording_stop_time
+                    )
+                else:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - reference_timestamp
+                    )
 
 
             response = (response or "").strip()
@@ -1137,6 +1271,8 @@ class ParallelVoiceAssistant:
                 future = self.tts.generate_and_queue(sentence, segment_id)
                 if future is not None:
                     self.stats.tts_segments += 1
+                    with self._tts_futures_lock:
+                        self._pending_tts_futures.add(future)
                     tts_jobs.append((future, submit_time))
                 segment_id += 1
 
@@ -1161,13 +1297,15 @@ class ParallelVoiceAssistant:
         except Exception as exc:
             print(f"[TTS Pipeline] Generation failed: {exc}")
             self._handle_failed_tts_generation(pending)
-            return
-
-        if result:
-            latency = max(0.0, time.time() - start_time)
-            self.stats.tts_generation_latencies.append(latency)
         else:
-            self._handle_failed_tts_generation(pending)
+            if result:
+                latency = max(0.0, time.time() - start_time)
+                self.stats.tts_generation_latencies.append(latency)
+            else:
+                self._handle_failed_tts_generation(pending)
+        finally:
+            with self._tts_futures_lock:
+                self._pending_tts_futures.discard(future)
 
     def _handle_failed_tts_generation(self, pending: PendingOutput) -> None:
         with self._pending_lock:
@@ -1280,6 +1418,31 @@ class ParallelVoiceAssistant:
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
         print("----------------------\n")
+
+    def _wait_for_tts_completion(self, timeout: float = 15.0) -> None:
+        if self.stats.tts_segments == 0:
+            return
+
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            with self._tts_futures_lock:
+                pending_futures = len(self._pending_tts_futures)
+
+            with self._pending_lock:
+                pending_outputs = sum(
+                    1 for pending in self.stats.pending_outputs if pending.segments_expected > 0
+                )
+
+            queue_empty = self.tts.speech_queue.empty()
+
+            if pending_futures == 0 and pending_outputs == 0 and queue_empty:
+                break
+
+            if time.time() >= deadline:
+                print("[TTS] Timeout waiting for pending audio playback; continuing shutdown.")
+                break
+
+            time.sleep(0.05)
 
 
 # ================================================================
