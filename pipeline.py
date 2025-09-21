@@ -845,6 +845,7 @@ class ParallelVoiceAssistant:
 
         self._tts_futures_lock = threading.Lock()
         self._pending_tts_futures: Set[Future] = set()
+
         self._chunk_activity: Dict[int, bool] = {}
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
@@ -853,6 +854,7 @@ class ParallelVoiceAssistant:
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
         self._active_flush_ids: Set[int] = set()
+
 
 
     def _register_activity(self) -> None:
@@ -1164,12 +1166,15 @@ class ParallelVoiceAssistant:
             if is_noise or not normalized:
                 if had_activity and not normalized:
                     # Speech energy was observed for this chunk, but Whisper did not
+
                     # return any transcript yet. Treat as ongoing speech for a short
                     # period, but force an intermediate transcription if it persists.
+
                     print(
                         f"[STT] Chunk {res_chunk_id}: (speech detected, awaiting transcription)"
                     )
                     self._consecutive_silent_chunks = 0
+
                     self._awaiting_transcript_chunks += 1
                     if self._awaiting_transcript_started_at is None:
                         self._awaiting_transcript_started_at = time.time()
@@ -1180,6 +1185,7 @@ class ParallelVoiceAssistant:
                         self._queue_intermediate_transcription(
                             f"[STT] Forcing intermediate transcription after {elapsed:.1f}s without text"
                         )
+
                     continue
 
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
