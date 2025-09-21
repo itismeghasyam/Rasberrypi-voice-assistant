@@ -19,7 +19,7 @@ import wave
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 
 import numpy as np
@@ -793,6 +793,7 @@ class ParallelVoiceAssistant:
         self._activity_event = threading.Event()
         self._last_voice_time = time.time()
         self._has_detected_speech = False
+        self._first_voice_time: Optional[float] = None
         self._recording_stop_time: Optional[float] = None
         self._silence_timeout = float(silence_timeout)
         self._silence_threshold = float(silence_threshold)
@@ -817,11 +818,17 @@ class ParallelVoiceAssistant:
             r"\b(blank[_ ]?audio|wind blowing|bird chirping)\b", flags=re.IGNORECASE
         )
 
+        self._tts_futures_lock = threading.Lock()
+        self._pending_tts_futures: Set[Future] = set()
+
 
     def _register_activity(self) -> None:
+        now = time.time()
         with self._activity_lock:
+            if not self._has_detected_speech:
+                self._first_voice_time = now
             self._has_detected_speech = True
-            self._last_voice_time = time.time()
+            self._last_voice_time = now
         self._activity_event.set()
 
     def _is_silent_chunk(self, audio_chunk: np.ndarray) -> bool:
@@ -896,7 +903,11 @@ class ParallelVoiceAssistant:
         with self._activity_lock:
             self._has_detected_speech = False
             self._last_voice_time = start_time
+            self._first_voice_time = None
         self._recording_stop_time = None
+
+        with self._tts_futures_lock:
+            self._pending_tts_futures.clear()
 
         with self._stop_lock:
             self._stop_requested = False
@@ -972,6 +983,7 @@ class ParallelVoiceAssistant:
 
         self.stt.shutdown()
         self.llm.shutdown()
+        self._wait_for_tts_completion()
         self.tts.stop()
 
         elapsed = time.time() - start_time
@@ -1125,21 +1137,23 @@ class ParallelVoiceAssistant:
 
             self.stats.llm_latencies.append(latency)
 
-            if (
-                self.stats.recording_to_first_llm_latency is None
-                and self._recording_stop_time is not None
-            ):
-                self.stats.recording_to_first_llm_latency = max(
-                    0.0, response_ready_time - self._recording_stop_time
-                )
+            if self.stats.recording_to_first_llm_latency is None:
+                first_voice_time: Optional[float]
+                with self._activity_lock:
+                    first_voice_time = self._first_voice_time
 
-            elif (
-                self.stats.recording_to_first_llm_latency is None
-                and self._recording_stop_time is None
-            ):
-                self.stats.recording_to_first_llm_latency = max(
-                    0.0, response_ready_time - reference_timestamp
-                )
+                if first_voice_time is not None:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - first_voice_time
+                    )
+                elif self._recording_stop_time is not None:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - self._recording_stop_time
+                    )
+                else:
+                    self.stats.recording_to_first_llm_latency = max(
+                        0.0, response_ready_time - reference_timestamp
+                    )
 
 
             response = (response or "").strip()
@@ -1160,6 +1174,8 @@ class ParallelVoiceAssistant:
                 future = self.tts.generate_and_queue(sentence, segment_id)
                 if future is not None:
                     self.stats.tts_segments += 1
+                    with self._tts_futures_lock:
+                        self._pending_tts_futures.add(future)
                     tts_jobs.append((future, submit_time))
                 segment_id += 1
 
@@ -1184,13 +1200,15 @@ class ParallelVoiceAssistant:
         except Exception as exc:
             print(f"[TTS Pipeline] Generation failed: {exc}")
             self._handle_failed_tts_generation(pending)
-            return
-
-        if result:
-            latency = max(0.0, time.time() - start_time)
-            self.stats.tts_generation_latencies.append(latency)
         else:
-            self._handle_failed_tts_generation(pending)
+            if result:
+                latency = max(0.0, time.time() - start_time)
+                self.stats.tts_generation_latencies.append(latency)
+            else:
+                self._handle_failed_tts_generation(pending)
+        finally:
+            with self._tts_futures_lock:
+                self._pending_tts_futures.discard(future)
 
     def _handle_failed_tts_generation(self, pending: PendingOutput) -> None:
         with self._pending_lock:
@@ -1303,6 +1321,31 @@ class ParallelVoiceAssistant:
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
         print("----------------------\n")
+
+    def _wait_for_tts_completion(self, timeout: float = 15.0) -> None:
+        if self.stats.tts_segments == 0:
+            return
+
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            with self._tts_futures_lock:
+                pending_futures = len(self._pending_tts_futures)
+
+            with self._pending_lock:
+                pending_outputs = sum(
+                    1 for pending in self.stats.pending_outputs if pending.segments_expected > 0
+                )
+
+            queue_empty = self.tts.speech_queue.empty()
+
+            if pending_futures == 0 and pending_outputs == 0 and queue_empty:
+                break
+
+            if time.time() >= deadline:
+                print("[TTS] Timeout waiting for pending audio playback; continuing shutdown.")
+                break
+
+            time.sleep(0.05)
 
 
 # ================================================================
