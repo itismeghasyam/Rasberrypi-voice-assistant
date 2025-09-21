@@ -408,15 +408,7 @@ class BufferedTTS:
         if playback_cmd:
             self.playback_cmd = list(playback_cmd)
         else:
-            self.playback_cmd = [
-                "aplay",
-                "-q",
-                "-r", str(self._voice_info.sample_rate),
-                "-f","S16_LE",
-                "-t","raw",
-                "-",
-            ]
-
+            self.playback_cmd = ["aplay", "{file}"]
         self.use_subprocess = bool(use_subprocess)
         if output_device is None:
             self.output_device = None
