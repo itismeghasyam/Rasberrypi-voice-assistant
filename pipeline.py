@@ -843,7 +843,9 @@ class ParallelVoiceAssistant:
 
         self._tts_futures_lock = threading.Lock()
         self._pending_tts_futures: Set[Future] = set()
+
         self._chunk_activity: Dict[int, bool] = {}
+
 
 
     def _register_activity(self) -> None:
