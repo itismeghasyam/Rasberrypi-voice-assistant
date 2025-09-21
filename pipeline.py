@@ -416,6 +416,7 @@ class BufferedTTS:
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
+        timeout :int = 30
 
     ) -> None:
         self.model_path = Path(model_path)
