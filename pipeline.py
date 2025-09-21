@@ -888,3 +888,26 @@ class ModelPreloader:
         if not model.exists():
             print(f"[WARMUP] Whisper model missing at {model}")
             return
+
+# ---------- Add this to the bottom of pipeline.py ----------
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Run ParallelVoiceAssistant (test)")
+    parser.add_argument("--duration", type=float, default=15.0, help="Run duration in seconds")
+    parser.add_argument("--piper-model", type=str, default="piper_model.pt", help="Path to Piper model")
+    args = parser.parse_args()
+
+    print("[MAIN] Starting test runner")
+    try:
+        assistant = ParallelVoiceAssistant(
+            piper_model_path=Path(args.piper_model),
+            playback_cmd=None,
+            output_device=None,
+            use_subprocess_playback=False,
+        )
+        assistant.run(duration=args.duration)
+        print("[MAIN] Finished run()")
+    except Exception as e:
+        print(f"[MAIN] Exception during run: {e}")
