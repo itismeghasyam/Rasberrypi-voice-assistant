@@ -58,7 +58,8 @@ PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 
-CHUNK_DURATION = 2.0  # seconds
+CHUNK_DURATION = 3.0  # seconds
+
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
 
@@ -115,7 +116,7 @@ class StreamingRecorder:
             self._thread = None
 
 
-
+# ================================================================
 # Parallel Speech-to-Text (whisper.cpp)
 
 # ================================================================
@@ -124,7 +125,6 @@ class StreamingRecorder:
 class ParallelSTT:
 
     """Process audio chunks asynchronously using the whisper.cpp CLI."""
-
 
     def __init__(
         self,
@@ -283,7 +283,6 @@ class ParallelSTT:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
 
 
-
 # ================================================================
 # Streaming LLM via llama110
 # ================================================================
@@ -300,7 +299,6 @@ class StreamingLLM:
         self.llama_kwargs.setdefault("n_predict", 12)
         self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
         self.llama_kwargs.setdefault("temperature", 0.2)
-
 
     def process_incremental(self, text_chunk: str, is_final: bool = False) -> Optional[Future]:
         chunk = (text_chunk or "").strip()
@@ -405,16 +403,14 @@ class PiperVoiceInfo:
     metadata_path: Optional[Path] = None
 
 
-
 class BufferedTTS:
-    """Generate speech with Piper asynchronously and stream playback via paplay."""
+    """Generate speech with Piper asynchronously and stream playback via a CLI player."""
+
 
     def __init__(
         self,
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
-
-        timeout: int = 30,
 
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
@@ -736,6 +732,7 @@ class PipelineStats:
 
     recording_stop_time: Optional[float] = None
     recording_to_first_llm_latency: Optional[float] = None
+    recording_stop_to_first_tts_latency: Optional[float] = None
 
 
 
@@ -757,7 +754,7 @@ class ParallelVoiceAssistant:
 
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
-        force_subprocess_playback: bool = False,
+        use_subprocess_playback: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
 
@@ -777,7 +774,9 @@ class ParallelVoiceAssistant:
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
             output_device=output_device,
-            use_subprocess=force_subprocess_playback,
+
+            use_subprocess=use_subprocess_playback,
+
             on_playback_start=self._on_tts_playback_start,
             on_playback_error=self._on_tts_playback_error,
         )
@@ -789,12 +788,20 @@ class ParallelVoiceAssistant:
         self._pending_lock = threading.Lock()
 
         self._activity_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+
         self._activity_event = threading.Event()
         self._last_voice_time = time.time()
         self._has_detected_speech = False
         self._recording_stop_time: Optional[float] = None
         self._silence_timeout = float(silence_timeout)
         self._silence_threshold = float(silence_threshold)
+
+        self._stop_requested = False
+        self._stop_reason: Optional[str] = None
+        self._consecutive_silent_chunks = 0
+        self._silent_chunks_before_stop = 2
+
 
     def _register_activity(self) -> None:
         with self._activity_lock:
@@ -810,6 +817,38 @@ class ParallelVoiceAssistant:
             audio_view = audio_view.reshape(-1)
         rms = float(np.sqrt(np.mean(np.square(audio_view.astype(np.float32)))))
         return rms < self._silence_threshold
+
+
+    def _request_stop(self, reason: str) -> None:
+        with self._stop_lock:
+            if self._stop_requested:
+                return
+            self._stop_requested = True
+            self._stop_reason = reason
+            now = time.time()
+            if self._recording_stop_time is None:
+                self._recording_stop_time = now
+            self.stats.recording_stop_time = self._recording_stop_time
+        print(reason)
+        self.recorder.stop()
+        self._activity_event.set()
+
+    def _handle_silent_audio_chunk(self) -> None:
+        if self._stop_requested:
+            return
+        self._consecutive_silent_chunks += 1
+        if self._consecutive_silent_chunks < self._silent_chunks_before_stop:
+            return
+        if self._has_detected_speech:
+            message = (
+                f"[MAIN] No speech detected for {self._consecutive_silent_chunks} consecutive chunks; stopping recorder."
+            )
+        else:
+            message = (
+                f"[MAIN] Silence persisted for {self._consecutive_silent_chunks} consecutive chunks; stopping recorder."
+            )
+        self._request_stop(message)
+
 
     def _reference_timestamp_for_output(self, input_timestamp: float) -> float:
         candidates = [input_timestamp]
@@ -833,12 +872,20 @@ class ParallelVoiceAssistant:
         self.stats.start_time = start_time
         self.stats.recording_stop_time = None
         self.stats.recording_to_first_llm_latency = None
+
+        self.stats.recording_stop_to_first_tts_latency = None
+
         self._stt_done.clear()
         self._activity_event.clear()
         with self._activity_lock:
             self._has_detected_speech = False
             self._last_voice_time = start_time
         self._recording_stop_time = None
+
+        with self._stop_lock:
+            self._stop_requested = False
+            self._stop_reason = None
+        self._consecutive_silent_chunks = 0
 
 
         self.recorder.start()
@@ -853,12 +900,13 @@ class ParallelVoiceAssistant:
         try:
 
             while True:
+                if self._stop_requested:
+                    break
                 now = time.time()
                 if max_duration is not None and now - start_time >= max_duration:
-                    print(f"[MAIN] Max duration {max_duration:.1f}s reached; wrapping up.")
-
-                    self._recording_stop_time = now
-                    self.stats.recording_stop_time = now
+                    self._request_stop(
+                        f"[MAIN] Max duration {max_duration:.1f}s reached; wrapping up."
+                    )
 
                     break
 
@@ -867,10 +915,10 @@ class ParallelVoiceAssistant:
                     last_voice = self._last_voice_time
 
                 if has_voice and (now - last_voice) >= self._silence_timeout:
-                    print(f"[MAIN] Detected {self._silence_timeout:.1f}s of silence; stopping recorder.")
 
-                    self._recording_stop_time = now
-                    self.stats.recording_stop_time = now
+                    self._request_stop(
+                        f"[MAIN] Detected {self._silence_timeout:.1f}s of silence; stopping recorder."
+                    )
 
                     break
 
@@ -885,14 +933,12 @@ class ParallelVoiceAssistant:
 
         except KeyboardInterrupt:
             print("\n[MAIN] Interrupted by user")
-            interrupt_time = time.time()
-            self._recording_stop_time = interrupt_time
-            self.stats.recording_stop_time = interrupt_time
+            self._request_stop("[MAIN] Interrupted by user; stopping recorder.")
         finally:
             self.recorder.stop()
-            stop_time = time.time()
             if self._recording_stop_time is None:
-                self._recording_stop_time = stop_time
+                self._recording_stop_time = time.time()
+
             self.stats.recording_stop_time = self._recording_stop_time
 
         stt_thread.join(timeout=5.0)
@@ -927,7 +973,11 @@ class ParallelVoiceAssistant:
                     continue
 
 
-                if not self._is_silent_chunk(audio_chunk):
+                if self._is_silent_chunk(audio_chunk):
+                    self._handle_silent_audio_chunk()
+                else:
+                    self._consecutive_silent_chunks = 0
+
                     self._register_activity()
 
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
@@ -976,7 +1026,10 @@ class ParallelVoiceAssistant:
             if text:
 
                 self._register_activity()
-                print(f"[STT] Chunk {res_chunk_id}: {text}")
+                self._consecutive_silent_chunks = 0
+
+            print(f"[STT] Chunk {res_chunk_id}: {text}")
+
 
             llm_trigger_time = time.time()
             llm_future = self.llm.process_incremental(text, is_final=is_final)
@@ -1090,6 +1143,15 @@ class ParallelVoiceAssistant:
                     pass
 
     def _on_tts_playback_start(self, file_path: str, started_at: float) -> None:
+
+        if (
+            self.stats.recording_stop_to_first_tts_latency is None
+            and self._recording_stop_time is not None
+        ):
+            self.stats.recording_stop_to_first_tts_latency = max(
+                0.0, started_at - self._recording_stop_time
+            )
+
         with self._pending_lock:
             while self.stats.pending_outputs:
                 pending = self.stats.pending_outputs[0]
@@ -1165,6 +1227,14 @@ class ParallelVoiceAssistant:
             )
         else:
             print("Recording -> first LLM response: n/a")
+
+        if self.stats.recording_stop_to_first_tts_latency is not None:
+            print(
+                "Recording stop -> first TTS audio: "
+                f"{self.stats.recording_stop_to_first_tts_latency:.2f}s"
+            )
+        else:
+            print("Recording stop -> first TTS audio: n/a")
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
@@ -1303,7 +1373,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-subprocess-playback",
         action="store_true",
-        help="Skip direct sounddevice playback and always use the playback command",
+
+        help="Always use the playback command for Piper audio (default)",
+    )
+    parser.add_argument(
+        "--direct-playback",
+        action="store_true",
+        help="Play Piper audio through sounddevice instead of piping to the CLI player",
     )
 
     parser.add_argument(
@@ -1343,9 +1419,15 @@ def main() -> None:
 
     if args.warmup:
         ModelPreloader.warmup_whisper(args.whisper_cli, args.whisper_model)
-
         ModelPreloader.warmup_llama(llama_kwargs)
         ModelPreloader.warmup_piper(args.piper_model)
+
+    use_subprocess_playback = True
+    if args.direct_playback:
+        use_subprocess_playback = False
+    elif args.force_subprocess_playback:
+        use_subprocess_playback = True
+
 
     assistant = ParallelVoiceAssistant(
         chunk_duration=CHUNK_DURATION,
@@ -1361,7 +1443,8 @@ def main() -> None:
 
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
-        force_subprocess_playback=args.force_subprocess_playback,
+        use_subprocess_playback=use_subprocess_playback,
+
         silence_timeout=args.silence_timeout,
         silence_threshold=args.silence_threshold,
     )
