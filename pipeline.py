@@ -844,6 +844,9 @@ class ParallelVoiceAssistant:
         self._tts_futures_lock = threading.Lock()
         self._pending_tts_futures: Set[Future] = set()
 
+        self._chunk_activity: Dict[int, bool] = {}
+
+
 
     def _register_activity(self) -> None:
         now = time.time()
@@ -1036,6 +1039,7 @@ class ParallelVoiceAssistant:
                 # only count a chunk as "silent" once the model actually returns nothing
                 # useful for that chunk (avoids double-counting).
                 is_silent = self._is_silent_chunk(audio_chunk)
+                self._chunk_activity[chunk_id] = not is_silent
                 if is_silent:
                     # don't mark stop here; just log and continue to submit to STT so
                     # the model can confirm whether it's empty/noise
@@ -1049,9 +1053,9 @@ class ParallelVoiceAssistant:
                     except Exception:
                         rms = 0.0
                     print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
-                    
-                    # we saw energy; reset consecutive silent counter and register activity
-    
+                else:
+                    self._register_activity()
+                    self._consecutive_silent_chunks = 0
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
@@ -1100,6 +1104,7 @@ class ParallelVoiceAssistant:
 
             # Normalize for noise checks
             normalized = (text or "").strip().lower()
+            had_activity = self._chunk_activity.pop(res_chunk_id, False)
 
             # Check blacklist exact matches first, then regex for variants
             is_noise = False
@@ -1110,6 +1115,16 @@ class ParallelVoiceAssistant:
                     is_noise = True
 
             if is_noise or not normalized:
+                if had_activity and not normalized:
+                    # Speech energy was observed for this chunk, but Whisper did not
+                    # return any transcript yet. Treat as ongoing speech so we don't
+                    # prematurely trigger silence handling.
+                    print(
+                        f"[STT] Chunk {res_chunk_id}: (speech detected, awaiting transcription)"
+                    )
+                    self._consecutive_silent_chunks = 0
+                    continue
+
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
                 self._handle_silent_audio_chunk()
