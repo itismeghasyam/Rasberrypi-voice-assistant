@@ -638,8 +638,11 @@ class BufferedTTS:
 
         info = self._voice_info
         cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
-        if info.sample_rate:
-            cmd += ["--sample-rate", str(info.sample_rate)]
+        # Piper streams raw 16-bit PCM on stdout when --output-raw is used. We don't
+        # override the model's configured sample rate via CLI flags because some
+        # Piper builds don't accept those options and may echo them as text. The
+        # returned PCM is still generated at the voice's native sample rate, which
+        # we honour when creating the temporary WAV container below.
         if info.speaker_id is not None:
             cmd += ["--speaker", str(info.speaker_id)]
 
@@ -656,6 +659,13 @@ class BufferedTTS:
                 timeout=self.timeout,
             )
             audio_bytes = proc.stdout
+            if self._looks_like_text(audio_bytes):
+                preview = audio_bytes[:120].decode("utf-8", errors="replace")
+                print(
+                    "[TTS] Piper returned textual output instead of audio; "
+                    f"got: {preview!r}"
+                )
+                return None
             if not audio_bytes:
                 print("[TTS] Piper returned no audio data")
                 return None
@@ -691,6 +701,19 @@ class BufferedTTS:
                 except OSError:
                     pass
         return None
+
+    @staticmethod
+    def _looks_like_text(payload: bytes) -> bool:
+        """Heuristic check to detect when Piper prints text instead of PCM."""
+
+        if not payload:
+            return False
+
+        sample = payload[:64]
+        printable = sum(32 <= b <= 126 or b in (9, 10, 13) for b in sample)
+        # Random PCM rarely decodes into predominantly printable ASCII. Treat a
+        # mostly printable prefix as an indication that Piper emitted text/logs.
+        return printable >= max(10, len(sample) * 0.6)
 
     def stop(self) -> None:
         self.playing = False
