@@ -86,6 +86,15 @@ class StreamingRecorder:
         except queue.Empty:
             return None
 
+    def clear_queue(self) -> None:
+        """Remove any queued audio chunks without blocking."""
+
+        try:
+            while True:
+                self.chunk_queue.get_nowait()
+        except queue.Empty:
+            return
+
     def stop(self) -> None:
         """Signal the recorder to stop and wait for the background thread."""
 
@@ -372,6 +381,7 @@ class SpeechSegment:
     sample_rate: int
     channels: int = 1
     sampwidth: int = 2
+    text: str = ""
 
 
 @dataclass
@@ -610,7 +620,7 @@ class BufferedTTS:
 
 
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
-        clean_text = (text or "").strip()
+        clean_text = " ".join((text or "").split())
         if not clean_text:
             return None
         return self.executor.submit(self._generate_speech, clean_text, segment_id)
@@ -620,6 +630,10 @@ class BufferedTTS:
 
         if not self.model_path.exists():
             print(f"[TTS] Piper model not found: {self.model_path}")
+            return None
+
+        utterance = " ".join((text or "").split())
+        if not utterance:
             return None
 
         info = self._voice_info
@@ -633,9 +647,10 @@ class BufferedTTS:
             tmp_path = Path(tmp_file.name)
         keep_file = False
         try:
+            input_bytes = (utterance + "\n").encode("utf-8")
             proc = subprocess.run(
                 cmd,
-                input=text.encode("utf-8"),
+                input=input_bytes,
                 capture_output=True,
                 check=True,
                 timeout=self.timeout,
@@ -652,11 +667,13 @@ class BufferedTTS:
                 wf.writeframes(audio_bytes)
             keep_file = True
 
+            sample_rate = info.sample_rate or 22050
             segment = SpeechSegment(
                 path=str(tmp_path),
                 raw=audio_bytes,
-                sample_rate=info.sample_rate or 22050,
+                sample_rate=sample_rate,
                 channels=info.channels or 1,
+                text=utterance,
             )
             self.speech_queue.put(segment)
             return segment
@@ -829,6 +846,7 @@ class ParallelVoiceAssistant:
             self.stats.recording_stop_time = self._recording_stop_time
         print(reason)
         self.recorder.stop()
+        self.recorder.clear_queue()
         self._activity_event.set()
 
     def _handle_silent_audio_chunk(self) -> None:
@@ -969,6 +987,11 @@ class ParallelVoiceAssistant:
                 if audio_chunk is None:
                     self._process_stt_results(wait=False)
                     continue
+
+                if self._stop_requested and not self.recorder.recording:
+                    self.recorder.clear_queue()
+                    self._process_stt_results(wait=False)
+                    break
 
                 # remember recorder sample rate for VAD logic if needed
                 setattr(self, "_recorder_sample_rate", self.recorder.sample_rate)
