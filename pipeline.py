@@ -1,9 +1,11 @@
+
 """High-level streaming voice assistant pipeline with async Whisper STT, llama110 LLM, and Piper TTS.
 
 This module consolidates the experimental streaming helpers that previously lived in
 ``voice_parallel.py`` while switching the speech-to-text stage to whisper.cpp, the language
 model stage to the ``llama110`` helper from :mod:`voice_test`, and the text-to-speech stage
 to Piper.  The design mirrors the old parallel prototype: audio is captured continuously in
+
 background threads, fed to an asynchronous STT worker pool, passed through a streaming LLM
 interface, and finally voiced through a buffered TTS player.
 
@@ -11,6 +13,7 @@ The default configuration expects the following local assets:
 
 * whisper.cpp binary: ``~/whisper.cpp/build/bin/whisper-cli``
 * Whisper model: ``~/whisper.cpp/models/ggml-tiny.bin``
+
 * ``llama.cpp`` binary and llama110 model (see :func:`voice_test.llama110`)
 * Piper voice model, defaulting to ``~/Rasberrypi-voice-assistant/voices/en_US-amy-medium.onnx``
 
@@ -21,25 +24,30 @@ All components are exposed as classes so they can be reused or extended individu
 from __future__ import annotations
 
 import argparse
+
 import contextlib
 import json
 import os
 import queue
 import shutil
 import subprocess
+
 import tempfile
 import threading
 import time
 import wave
+
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
+
 import numpy as np
 import psutil
 import sounddevice as sd
 from concurrent.futures import Future, ThreadPoolExecutor
+
 
 from voice_test import llama110
 
@@ -49,12 +57,15 @@ from voice_test import llama110
 PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
+
 CHUNK_DURATION = 3.0  # seconds
+
 DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 500.0  # RMS amplitude threshold for silence detection
 
 WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
+
 
 PIPER_MODEL_PATH = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
 
@@ -107,15 +118,18 @@ class StreamingRecorder:
 
 # ================================================================
 # Parallel Speech-to-Text (whisper.cpp)
+
 # ================================================================
 
 
 class ParallelSTT:
+
     """Process audio chunks asynchronously using the whisper.cpp CLI."""
 
     def __init__(
         self,
         num_workers: int = 2,
+
         sample_rate: int = SAMPLE_RATE,
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
@@ -241,9 +255,11 @@ class ParallelSTT:
     def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
         return {"chunk_id": chunk_id, "text": "", "is_final": False}
 
+
     # -------------------------- Public API -----------------------
 
     def submit_chunk(self, audio_chunk: np.ndarray, chunk_id: int) -> Future:
+
         audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
         with self._transcript_lock:
             self._chunks.append(audio_bytes)
@@ -279,6 +295,7 @@ class StreamingLLM:
         self.context_buffer: List[str] = []
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.llama_kwargs = llama_kwargs or {}
+
         self.llama_kwargs.setdefault("n_predict", 12)
         self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
         self.llama_kwargs.setdefault("temperature", 0.2)
@@ -316,9 +333,11 @@ class StreamingLLM:
         call_kwargs = {
             "llama_cli_path": self.llama_kwargs.get("llama_cli_path"),
             "model_path": self.llama_kwargs.get("model_path"),
+
             "n_predict": self.llama_kwargs.get("n_predict", 12),
             "threads": self.llama_kwargs.get("threads", os.cpu_count() or 4),
             "temperature": self.llama_kwargs.get("temperature", 0.2),
+
             "sampler": self.llama_kwargs.get("sampler"),
             "tts_after": False,
             "tts_cmd": None,
@@ -338,6 +357,7 @@ class StreamingLLM:
         if not response:
             fallback = (result or {}).get("raw_stdout") or ""
             response = fallback.strip()
+
         return self._clean_response(response)
 
     @staticmethod
@@ -355,6 +375,7 @@ class StreamingLLM:
             text = text[1:].lstrip()
         return text
 
+
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
 
@@ -362,6 +383,7 @@ class StreamingLLM:
 # ================================================================
 # Piper-based TTS with playback buffering
 # ================================================================
+
 
 
 @dataclass
@@ -384,15 +406,17 @@ class PiperVoiceInfo:
 class BufferedTTS:
     """Generate speech with Piper asynchronously and stream playback via a CLI player."""
 
+
     def __init__(
         self,
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
-        timeout: int = 30,
+
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
+
     ) -> None:
         self.model_path = Path(model_path)
         self.timeout = int(timeout)
@@ -414,6 +438,7 @@ class BufferedTTS:
                 "raw",
                 "-",
             ]
+
         self.use_subprocess = bool(use_subprocess)
         if output_device is None:
             self.output_device = None
@@ -428,10 +453,12 @@ class BufferedTTS:
             self.output_device = output_device
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
+
         self._playback_env = os.environ.copy()
         if isinstance(self.output_device, str):
             # Hint to PulseAudio-based players which sink to target.
             self._playback_env.setdefault("PULSE_SINK", self.output_device)
+
 
     def _load_voice_info(self) -> PiperVoiceInfo:
         candidates = [
@@ -481,6 +508,7 @@ class BufferedTTS:
 
         return PiperVoiceInfo()
 
+
     def start_playback(self) -> None:
         if self.playing:
             return
@@ -491,6 +519,7 @@ class BufferedTTS:
     def _playback_loop(self) -> None:
         while self.playing:
             try:
+
                 segment = self.speech_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
@@ -512,6 +541,7 @@ class BufferedTTS:
             try:
                 if segment.path:
                     Path(segment.path).unlink(missing_ok=True)
+
             except OSError:
                 pass
 
@@ -522,6 +552,7 @@ class BufferedTTS:
             self.on_playback_error()
         except Exception as exc:
             print(f"[TTS] Playback error callback failed: {exc}")
+
 
     def _play_via_sounddevice(self, segment: SpeechSegment) -> bool:
         try:
@@ -596,13 +627,16 @@ class BufferedTTS:
             print(f"[TTS] Subprocess playback failed for {segment.path}: {exc}")
             return False
 
+
     def generate_and_queue(self, text: str, segment_id: int) -> Optional[Future]:
         clean_text = (text or "").strip()
         if not clean_text:
             return None
         return self.executor.submit(self._generate_speech, clean_text, segment_id)
 
+
     def _generate_speech(self, text: str, segment_id: int) -> Optional[SpeechSegment]:
+
         if not self.model_path.exists():
             print(f"[TTS] Piper model not found: {self.model_path}")
             return None
@@ -645,14 +679,17 @@ class BufferedTTS:
             )
             self.speech_queue.put(segment)
             return segment
+
         except subprocess.CalledProcessError as exc:
             print(f"[TTS] Piper returned error: {exc}")
         except Exception as exc:
             print(f"[TTS] Piper failed: {exc}")
         finally:
+
             if not keep_file and tmp_path.exists():
                 try:
                     tmp_path.unlink(missing_ok=True)
+
                 except OSError:
                     pass
         return None
@@ -671,6 +708,7 @@ class BufferedTTS:
 
 
 @dataclass
+
 class PendingOutput:
     timestamp: float
     segments_expected: int
@@ -678,20 +716,24 @@ class PendingOutput:
 
 
 @dataclass
+
 class PipelineStats:
     stt_chunks: int = 0
     llm_responses: int = 0
     tts_segments: int = 0
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
+
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
     tts_generation_latencies: List[float] = field(default_factory=list)
     input_to_output_latencies: List[float] = field(default_factory=list)
     pending_outputs: Deque[PendingOutput] = field(default_factory=deque)
+
     recording_stop_time: Optional[float] = None
     recording_to_first_llm_latency: Optional[float] = None
     recording_stop_to_first_tts_latency: Optional[float] = None
+
 
 
 class ParallelVoiceAssistant:
@@ -702,17 +744,20 @@ class ParallelVoiceAssistant:
         chunk_duration: float = CHUNK_DURATION,
         sample_rate: int = SAMPLE_RATE,
         stt_workers: int = 2,
+
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
         whisper_threads: Optional[int] = None,
         emit_stt_partials: bool = False,
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
+
         output_device: Optional[Any] = None,
         playback_cmd: Optional[Iterable[str]] = None,
         use_subprocess_playback: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+
     ) -> None:
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
         self.stt = ParallelSTT(
@@ -724,11 +769,14 @@ class ParallelVoiceAssistant:
             emit_partials=emit_stt_partials,
         )
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
+
         self.tts = BufferedTTS(
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
             output_device=output_device,
+
             use_subprocess=use_subprocess_playback,
+
             on_playback_start=self._on_tts_playback_start,
             on_playback_error=self._on_tts_playback_error,
         )
@@ -738,18 +786,22 @@ class ParallelVoiceAssistant:
         self.stats = PipelineStats()
         self._stt_done = threading.Event()
         self._pending_lock = threading.Lock()
+
         self._activity_lock = threading.Lock()
         self._stop_lock = threading.Lock()
+
         self._activity_event = threading.Event()
         self._last_voice_time = time.time()
         self._has_detected_speech = False
         self._recording_stop_time: Optional[float] = None
         self._silence_timeout = float(silence_timeout)
         self._silence_threshold = float(silence_threshold)
+
         self._stop_requested = False
         self._stop_reason: Optional[str] = None
         self._consecutive_silent_chunks = 0
         self._silent_chunks_before_stop = 2
+
 
     def _register_activity(self) -> None:
         with self._activity_lock:
@@ -765,6 +817,7 @@ class ParallelVoiceAssistant:
             audio_view = audio_view.reshape(-1)
         rms = float(np.sqrt(np.mean(np.square(audio_view.astype(np.float32)))))
         return rms < self._silence_threshold
+
 
     def _request_stop(self, reason: str) -> None:
         with self._stop_lock:
@@ -796,6 +849,7 @@ class ParallelVoiceAssistant:
             )
         self._request_stop(message)
 
+
     def _reference_timestamp_for_output(self, input_timestamp: float) -> float:
         candidates = [input_timestamp]
         with self._activity_lock:
@@ -818,17 +872,21 @@ class ParallelVoiceAssistant:
         self.stats.start_time = start_time
         self.stats.recording_stop_time = None
         self.stats.recording_to_first_llm_latency = None
+
         self.stats.recording_stop_to_first_tts_latency = None
+
         self._stt_done.clear()
         self._activity_event.clear()
         with self._activity_lock:
             self._has_detected_speech = False
             self._last_voice_time = start_time
         self._recording_stop_time = None
+
         with self._stop_lock:
             self._stop_requested = False
             self._stop_reason = None
         self._consecutive_silent_chunks = 0
+
 
         self.recorder.start()
         self.tts.start_playback()
@@ -840,6 +898,7 @@ class ParallelVoiceAssistant:
         llm_thread.start()
 
         try:
+
             while True:
                 if self._stop_requested:
                     break
@@ -848,6 +907,7 @@ class ParallelVoiceAssistant:
                     self._request_stop(
                         f"[MAIN] Max duration {max_duration:.1f}s reached; wrapping up."
                     )
+
                     break
 
                 with self._activity_lock:
@@ -855,9 +915,11 @@ class ParallelVoiceAssistant:
                     last_voice = self._last_voice_time
 
                 if has_voice and (now - last_voice) >= self._silence_timeout:
+
                     self._request_stop(
                         f"[MAIN] Detected {self._silence_timeout:.1f}s of silence; stopping recorder."
                     )
+
                     break
 
                 wait_timeout = 0.5
@@ -868,6 +930,7 @@ class ParallelVoiceAssistant:
                 triggered = self._activity_event.wait(timeout=wait_timeout)
                 if triggered:
                     self._activity_event.clear()
+
         except KeyboardInterrupt:
             print("\n[MAIN] Interrupted by user")
             self._request_stop("[MAIN] Interrupted by user; stopping recorder.")
@@ -875,13 +938,16 @@ class ParallelVoiceAssistant:
             self.recorder.stop()
             if self._recording_stop_time is None:
                 self._recording_stop_time = time.time()
+
             self.stats.recording_stop_time = self._recording_stop_time
 
         stt_thread.join(timeout=5.0)
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
+
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
+
             self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
@@ -906,14 +972,17 @@ class ParallelVoiceAssistant:
                     self._process_stt_results(wait=False)
                     continue
 
+
                 if self._is_silent_chunk(audio_chunk):
                     self._handle_silent_audio_chunk()
                 else:
                     self._consecutive_silent_chunks = 0
+
                     self._register_activity()
 
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
+
                 self.stats.stt_chunks += 1
                 chunk_id += 1
 
@@ -925,9 +994,11 @@ class ParallelVoiceAssistant:
             pass
 
     def _process_stt_results(self, wait: bool) -> None:
+
         pending: List[Tuple[int, Future, float]] = []
         while not self.stt_futures.empty():
             chunk_id, future, start_time = self.stt_futures.get()
+
             if wait or future.done():
                 try:
                     result = future.result()
@@ -935,30 +1006,37 @@ class ParallelVoiceAssistant:
                     print(f"[STT Pipeline] Future for chunk {chunk_id} failed: {exc}")
                     continue
             else:
+
                 pending.append((chunk_id, future, start_time))
+
                 continue
 
             if not result:
                 continue
 
+
             latency = max(0.0, time.time() - start_time)
             self.stats.stt_latencies.append(latency)
+
 
             text = (result.get("text") or "").strip()
             is_final = bool(result.get("is_final"))
             res_chunk_id = result.get("chunk_id", chunk_id)
 
             if text:
+
                 self._register_activity()
                 self._consecutive_silent_chunks = 0
 
             print(f"[STT] Chunk {res_chunk_id}: {text}")
+
 
             llm_trigger_time = time.time()
             llm_future = self.llm.process_incremental(text, is_final=is_final)
             if llm_future is not None:
                 reference_time = self._reference_timestamp_for_output(llm_trigger_time)
                 self.llm_futures.put((llm_future, llm_trigger_time, reference_time))
+
 
         for item in pending:
             self.stt_futures.put(item)
@@ -967,19 +1045,25 @@ class ParallelVoiceAssistant:
         segment_id = 0
         while not self._stt_done.is_set() or not self.llm_futures.empty():
             try:
+
                 llm_future, _submit_time, reference_timestamp = self.llm_futures.get(timeout=0.5)
+
             except queue.Empty:
                 continue
 
             response = ""
             try:
                 response = llm_future.result(timeout=300)
+
                 response_ready_time = time.time()
+
             except Exception as exc:
                 print(f"[LLM Pipeline] Error: {exc}")
                 continue
 
+
             latency = max(0.0, response_ready_time - reference_timestamp)
+
             self.stats.llm_latencies.append(latency)
 
             if (
@@ -989,6 +1073,7 @@ class ParallelVoiceAssistant:
                 self.stats.recording_to_first_llm_latency = max(
                     0.0, response_ready_time - self._recording_stop_time
                 )
+
             elif (
                 self.stats.recording_to_first_llm_latency is None
                 and self._recording_stop_time is None
@@ -997,12 +1082,14 @@ class ParallelVoiceAssistant:
                     0.0, response_ready_time - reference_timestamp
                 )
 
+
             response = (response or "").strip()
             if not response:
                 continue
 
             print(f"[LLM] Response: {response[:120]}{'...' if len(response) > 120 else ''}")
             self.stats.llm_responses += 1
+
 
             sentences = self._split_sentences(response)
             if not sentences:
@@ -1020,8 +1107,10 @@ class ParallelVoiceAssistant:
             if not tts_jobs:
                 continue
 
+
             pending_timestamp = self._reference_timestamp_for_output(reference_timestamp)
             pending = PendingOutput(timestamp=pending_timestamp, segments_expected=len(tts_jobs))
+
             with self._pending_lock:
                 self.stats.pending_outputs.append(pending)
 
@@ -1054,6 +1143,7 @@ class ParallelVoiceAssistant:
                     pass
 
     def _on_tts_playback_start(self, file_path: str, started_at: float) -> None:
+
         if (
             self.stats.recording_stop_to_first_tts_latency is None
             and self._recording_stop_time is not None
@@ -1061,6 +1151,7 @@ class ParallelVoiceAssistant:
             self.stats.recording_stop_to_first_tts_latency = max(
                 0.0, started_at - self._recording_stop_time
             )
+
         with self._pending_lock:
             while self.stats.pending_outputs:
                 pending = self.stats.pending_outputs[0]
@@ -1103,6 +1194,7 @@ class ParallelVoiceAssistant:
             sentences.append(" ".join(current))
         return sentences
 
+
     @staticmethod
     def _print_latency_summary(label: str, samples: List[float]) -> None:
         if not samples:
@@ -1114,6 +1206,7 @@ class ParallelVoiceAssistant:
         max_val = max(samples)
         print(f"{label}: avg {avg:.2f}s (min {min_val:.2f}s, max {max_val:.2f}s, n={len(samples)})")
 
+
     def _print_stats(self, elapsed: float) -> None:
         print("\n--- PIPELINE STATS ---")
         print(f"Runtime: {elapsed:.2f}s")
@@ -1124,6 +1217,7 @@ class ParallelVoiceAssistant:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / (1024 * 1024)
         print(f"Memory usage: {mem_mb:.1f} MB")
+
         self._print_latency_summary("STT chunk latency", list(self.stats.stt_latencies))
         self._print_latency_summary("LLM response latency", list(self.stats.llm_latencies))
         if self.stats.recording_to_first_llm_latency is not None:
@@ -1133,6 +1227,7 @@ class ParallelVoiceAssistant:
             )
         else:
             print("Recording -> first LLM response: n/a")
+
         if self.stats.recording_stop_to_first_tts_latency is not None:
             print(
                 "Recording stop -> first TTS audio: "
@@ -1142,6 +1237,7 @@ class ParallelVoiceAssistant:
             print("Recording stop -> first TTS audio: n/a")
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
+
         print("----------------------\n")
 
 
@@ -1154,6 +1250,7 @@ class ModelPreloader:
     """Utility helpers to warm up the local models so first inference is faster."""
 
     @staticmethod
+
     def warmup_whisper(
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
@@ -1197,6 +1294,7 @@ class ModelPreloader:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         if success:
             print("[WARMUP] whisper.cpp ready")
+
 
     @staticmethod
     def warmup_llama(llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
@@ -1242,6 +1340,7 @@ class ModelPreloader:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
+
     parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
     parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
@@ -1268,11 +1367,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
     parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
     parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
+
     parser.add_argument("--output-device", type=str, default=None, help="sounddevice output (index or name) for Piper playback")
     parser.add_argument("--playback-cmd", nargs="+", default=None, help="Fallback playback command for Piper audio")
     parser.add_argument(
         "--force-subprocess-playback",
         action="store_true",
+
         help="Always use the playback command for Piper audio (default)",
     )
     parser.add_argument(
@@ -1280,6 +1381,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Play Piper audio through sounddevice instead of piping to the CLI player",
     )
+
     parser.add_argument(
         "--silence-timeout",
         type=float,
@@ -1292,11 +1394,13 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_SILENCE_THRESHOLD,
         help="RMS amplitude threshold (int16) to treat chunks as silence",
     )
+
     parser.add_argument(
         "--enable-stt-partials",
         action="store_true",
         help="Run whisper.cpp on each chunk for incremental transcripts",
     )
+
     return parser.parse_args()
 
 
@@ -1312,6 +1416,7 @@ def main() -> None:
     if args.llama_model:
         llama_kwargs["model_path"] = str(args.llama_model)
 
+
     if args.warmup:
         ModelPreloader.warmup_whisper(args.whisper_cli, args.whisper_model)
         ModelPreloader.warmup_llama(llama_kwargs)
@@ -1323,24 +1428,29 @@ def main() -> None:
     elif args.force_subprocess_playback:
         use_subprocess_playback = True
 
+
     assistant = ParallelVoiceAssistant(
         chunk_duration=CHUNK_DURATION,
         sample_rate=SAMPLE_RATE,
         stt_workers=2,
+
         whisper_exe=args.whisper_cli,
         whisper_model=args.whisper_model,
         whisper_threads=args.whisper_threads,
         emit_stt_partials=args.enable_stt_partials,
         piper_model_path=args.piper_model,
         llama_kwargs=llama_kwargs,
+
         output_device=args.output_device,
         playback_cmd=args.playback_cmd,
         use_subprocess_playback=use_subprocess_playback,
+
         silence_timeout=args.silence_timeout,
         silence_threshold=args.silence_threshold,
     )
     max_duration = args.duration if args.duration and args.duration > 0 else None
     assistant.run(duration=max_duration)
+
 
 
 if __name__ == "__main__":
