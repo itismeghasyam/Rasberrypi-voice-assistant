@@ -969,14 +969,34 @@ class ParallelVoiceAssistant:
                     self._process_stt_results(wait=False)
                     continue
 
+                # remember recorder sample rate for VAD logic if needed
+                setattr(self, "_recorder_sample_rate", self.recorder.sample_rate)
 
-                if self._is_silent_chunk(audio_chunk):
-                    self._handle_silent_audio_chunk()
+                # Decide whether this chunk is silent/noisy for logging, but DO NOT call
+                # _handle_silent_audio_chunk() here. We wait for the STT result so we
+                # only count a chunk as "silent" once the model actually returns nothing
+                # useful for that chunk (avoids double-counting).
+                is_silent = self._is_silent_chunk(audio_chunk)
+                if is_silent:
+                    # don't mark stop here; just log and continue to submit to STT so
+                    # the model can confirm whether it's empty/noise
+                    # (This prevents short/quiet speech from being mis-classified.)
+                    # Optional: print RMS for debugging:
+                    try:
+                        audio_view = np.asarray(audio_chunk, dtype=np.int16)
+                        if audio_view.ndim > 1:
+                            audio_view = audio_view.reshape(-1)
+                        rms = float(np.sqrt(np.mean(np.square(audio_view.astype(np.float32)))))
+                    except Exception:
+                        rms = 0.0
+                    print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
                 else:
+                    # we saw energy; reset consecutive silent counter and register activity
                     self._consecutive_silent_chunks = 0
-
                     self._register_activity()
 
+                # Submit to STT as usual (we rely on _process_stt_results to treat
+                # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
                 future = self.stt.submit_chunk(audio_chunk, chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
 
