@@ -1063,7 +1063,11 @@ class ParallelVoiceAssistant:
         self._stop_lock = threading.Lock()
 
         self._activity_event = threading.Event()
-        self._last_voice_time = time.time()
+        now = time.time()
+        self._last_voice_time = now
+        self._last_confirmed_voice_time: Optional[float] = None
+        self._pending_activity: Dict[int, float] = {}
+        self._session_start_time = now
         self._has_detected_speech = False
         self._first_voice_time: Optional[float] = None
         self._recording_stop_time: Optional[float] = None
@@ -1104,13 +1108,45 @@ class ParallelVoiceAssistant:
 
 
 
-    def _register_activity(self) -> None:
-        now = time.time()
+    def _mark_provisional_activity(self, chunk_id: int, timestamp: Optional[float] = None) -> None:
+        now = timestamp or time.time()
         with self._activity_lock:
             if not self._has_detected_speech:
                 self._first_voice_time = now
+            self._pending_activity[chunk_id] = now
             self._has_detected_speech = True
             self._last_voice_time = now
+        self._activity_event.set()
+
+    def _clear_provisional_activity(self, chunk_id: int) -> None:
+        with self._activity_lock:
+            removed = self._pending_activity.pop(chunk_id, None)
+            if removed is None:
+                return
+
+            candidates: List[float] = []
+            if self._last_confirmed_voice_time is not None:
+                candidates.append(self._last_confirmed_voice_time)
+            candidates.extend(self._pending_activity.values())
+
+            if candidates:
+                self._last_voice_time = max(candidates)
+                self._has_detected_speech = True
+            else:
+                self._has_detected_speech = False
+                self._last_voice_time = self._session_start_time
+                self._first_voice_time = None
+
+    def _register_activity(self, chunk_id: Optional[int] = None) -> None:
+        now = time.time()
+        with self._activity_lock:
+            if chunk_id is not None:
+                self._pending_activity.pop(chunk_id, None)
+            if self._first_voice_time is None:
+                self._first_voice_time = now
+            self._has_detected_speech = True
+            self._last_voice_time = now
+            self._last_confirmed_voice_time = now
         self._activity_event.set()
 
     def _reset_awaiting_transcript_state(self) -> None:
@@ -1217,6 +1253,9 @@ class ParallelVoiceAssistant:
             self._has_detected_speech = False
             self._last_voice_time = start_time
             self._first_voice_time = None
+            self._last_confirmed_voice_time = None
+            self._pending_activity.clear()
+            self._session_start_time = start_time
         self._recording_stop_time = None
 
         with self._tts_futures_lock:
@@ -1344,10 +1383,9 @@ class ParallelVoiceAssistant:
                         rms = 0.0
                     print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
                 else:
-                    # Defer activity tracking until Whisper confirms actual text for
-                    # this chunk. High-energy noise without a transcript shouldn't
-                    # refresh the silence timeout window.
-                    pass
+                    # Mark provisional activity so the main loop can begin silence
+                    # tracking even before Whisper confirms the transcript.
+                    self._mark_provisional_activity(chunk_id)
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
@@ -1442,6 +1480,7 @@ class ParallelVoiceAssistant:
                         # Ambient noise can keep RMS high while Whisper emits nothing; treat
                         # this as silence so we still stop after the configured no-speech chunks.
                         self._reset_awaiting_transcript_state()
+                        self._clear_provisional_activity(res_chunk_id)
                         self._handle_silent_audio_chunk()
                         continue
                     if self._should_force_intermediate_transcription():
@@ -1457,6 +1496,7 @@ class ParallelVoiceAssistant:
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
                 self._reset_awaiting_transcript_state()
+                self._clear_provisional_activity(res_chunk_id)
                 self._handle_silent_audio_chunk()
                 # We still want to surface the log, but skip registering activity and LLM trigger
                 # continue to next future
@@ -1464,7 +1504,7 @@ class ParallelVoiceAssistant:
 
             # Otherwise it's valid speech
             self._reset_awaiting_transcript_state()
-            self._register_activity()
+            self._register_activity(chunk_id=res_chunk_id)
             self._consecutive_silent_chunks = 0
 
             print(f"[STT] Chunk {res_chunk_id}: {text}")
