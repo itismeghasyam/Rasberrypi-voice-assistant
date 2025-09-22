@@ -3,12 +3,14 @@
 from __future__ import annotations
 import re
 import argparse
+import errno
 
 import contextlib
 import json
 import math
 import os
 import queue
+import selectors
 import shutil
 import subprocess
 
@@ -25,11 +27,17 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tu
 
 import numpy as np
 import psutil
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:  # pragma: no cover - optional dependency
+    sd = None  # type: ignore[assignment]
 from concurrent.futures import Future, ThreadPoolExecutor
 
 
-from voice_test import llama110
+try:
+    from voice_test import llama110
+except Exception:  # pragma: no cover - optional dependency
+    llama110 = None  # type: ignore[assignment]
 
 # ================================================================
 # Configuration
@@ -66,6 +74,9 @@ class StreamingRecorder:
 
     def start(self) -> None:
         """Start capturing microphone audio in a background thread."""
+
+        if sd is None:
+            raise RuntimeError("sounddevice is required for microphone recording")
 
         if self.recording:
             return
@@ -333,6 +344,10 @@ class StreamingLLM:
             "timeout_seconds": self.llama_kwargs.get("timeout_seconds", 240),
         }
 
+        if llama110 is None:
+            print("[LLM] llama110 is not available")
+            return "I could not load the local LLM."
+
         try:
             result = llama110(prompt_text=prompt, **call_kwargs)
         except FileNotFoundError as exc:
@@ -401,12 +416,12 @@ class BufferedTTS:
         self,
         model_path: Path = PIPER_MODEL_PATH,
         playback_cmd: Optional[Iterable[str]] = None,
-
+        piper_cmd: Optional[Iterable[str]] = None,
         output_device: Optional[Any] = None,
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
-        timeout :int = 30
+        timeout: int = 30,
 
     ) -> None:
         self.model_path = Path(model_path)
@@ -439,6 +454,18 @@ class BufferedTTS:
         if isinstance(self.output_device, str):
             # Hint to PulseAudio-based players which sink to target.
             self._playback_env.setdefault("PULSE_SINK", self.output_device)
+
+        self._piper_base_cmd = list(piper_cmd) if piper_cmd else ["piper"]
+        self._piper_process: Optional[subprocess.Popen[bytes]] = None
+        self._piper_stderr_thread: Optional[threading.Thread] = None
+        self._piper_stderr_stop: Optional[threading.Event] = None
+        self._piper_lock = threading.Lock()
+        self._piper_read_interval = 0.05
+        self._piper_idle_timeout = 0.35
+
+        if self.model_path.exists():
+            with self._piper_lock:
+                self._start_piper_process()
 
 
     def _load_voice_info(self) -> PiperVoiceInfo:
@@ -535,7 +562,191 @@ class BufferedTTS:
             print(f"[TTS] Playback error callback failed: {exc}")
 
 
+    def _build_piper_command(self) -> List[str]:
+        cmd = list(self._piper_base_cmd)
+        cmd += ["-m", str(self.model_path), "--output-raw"]
+        info = self._voice_info
+        has_speaker_flag = any(part in {"-s", "--speaker"} for part in cmd)
+        if info.speaker_id is not None and not has_speaker_flag:
+            cmd += ["--speaker", str(info.speaker_id)]
+        return cmd
+
+    def _start_piper_process(self) -> None:
+        self._stop_piper_process()
+        cmd = self._build_piper_command()
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except FileNotFoundError:
+            print(f"[TTS] Piper executable not found: {cmd[0]}")
+            self._piper_process = None
+            return
+        except Exception as exc:
+            print(f"[TTS] Failed to start Piper process: {exc}")
+            self._piper_process = None
+            return
+
+        self._piper_process = process
+        stop_event = threading.Event()
+        self._piper_stderr_stop = stop_event
+        if process.stderr is not None:
+            self._piper_stderr_thread = threading.Thread(
+                target=self._drain_piper_stderr,
+                name="PiperStderr",
+                args=(process.stderr, stop_event),
+                daemon=True,
+            )
+            self._piper_stderr_thread.start()
+
+    def _drain_piper_stderr(self, stream: Any, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                chunk = stream.readline()
+            except Exception:
+                break
+
+            if not chunk:
+                break
+
+            try:
+                message = chunk.decode("utf-8", errors="replace").strip()
+            except Exception:
+                message = ""
+
+            if message:
+                print(f"[TTS][Piper] {message}")
+
+    def _stop_piper_process(self) -> None:
+        process = self._piper_process
+        self._piper_process = None
+
+        if process is None:
+            return
+
+        stop_event = self._piper_stderr_stop
+        if stop_event is not None:
+            stop_event.set()
+
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except Exception:
+            pass
+
+        try:
+            if process.stderr:
+                process.stderr.close()
+        except Exception:
+            pass
+
+        try:
+            process.terminate()
+            process.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if self._piper_stderr_thread and self._piper_stderr_thread.is_alive():
+            self._piper_stderr_thread.join(timeout=0.5)
+        self._piper_stderr_thread = None
+        self._piper_stderr_stop = None
+
+    def _ensure_piper_process(self) -> Optional[subprocess.Popen[bytes]]:
+        process = self._piper_process
+        if process is None or process.poll() is not None:
+            self._start_piper_process()
+            process = self._piper_process
+        return process
+
+    def _write_to_piper(self, process: subprocess.Popen[bytes], utterance: str) -> None:
+        if process.stdin is None:
+            raise RuntimeError("Piper stdin is unavailable")
+
+        payload = (utterance + "\n").encode("utf-8")
+        process.stdin.write(payload)
+        process.stdin.flush()
+
+    def _read_from_piper(self, process: subprocess.Popen[bytes]) -> bytes:
+        stdout = process.stdout
+        if stdout is None:
+            raise RuntimeError("Piper stdout is unavailable")
+
+        buffer = bytearray()
+        idle_started: Optional[float] = None
+        deadline = time.time() + max(1.0, float(self.timeout))
+
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(stdout, selectors.EVENT_READ)
+        except Exception as exc:
+            selector.close()
+            raise RuntimeError(f"Failed to monitor Piper stdout: {exc}")
+
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0 and not buffer:
+                    raise TimeoutError("Timed out waiting for Piper audio")
+
+                wait_time = self._piper_read_interval
+                if remaining > 0:
+                    wait_time = min(wait_time, remaining)
+
+                events = selector.select(wait_time)
+                if events:
+                    try:
+                        if hasattr(stdout, "read1"):
+                            chunk = stdout.read1(4096)
+                        else:
+                            chunk = stdout.read(4096)
+                    except Exception as exc:
+                        raise RuntimeError(f"Failed reading Piper audio: {exc}")
+
+                    if not chunk:
+                        break
+
+                    buffer.extend(chunk)
+                    idle_started = None
+                    continue
+
+                if process.poll() is not None:
+                    break
+
+                if buffer:
+                    if idle_started is None:
+                        idle_started = time.time()
+                    elif time.time() - idle_started >= self._piper_idle_timeout:
+                        break
+                elif remaining <= 0:
+                    raise TimeoutError("Timed out waiting for Piper audio")
+
+        finally:
+            selector.close()
+
+        return bytes(buffer)
+
     def _play_via_sounddevice(self, segment: SpeechSegment) -> bool:
+        if sd is None:
+            return False
         try:
             if segment.raw:
                 audio = np.frombuffer(segment.raw, dtype=np.int16)
@@ -637,70 +848,75 @@ class BufferedTTS:
         if not utterance:
             return None
 
-        info = self._voice_info
-        cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
-        # Piper streams raw 16-bit PCM on stdout when --output-raw is used. We don't
-        # override the model's configured sample rate via CLI flags because some
-        # Piper builds don't accept those options and may echo them as text. The
-        # returned PCM is still generated at the voice's native sample rate, which
-        # we honour when creating the temporary WAV container below.
-        if info.speaker_id is not None:
-            cmd += ["--speaker", str(info.speaker_id)]
-
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_path = Path(tmp_file.name)
         keep_file = False
+        audio_bytes: Optional[bytes] = None
+        restart_needed = False
         try:
-            input_bytes = (utterance + "\n").encode("utf-8")
-            proc = subprocess.run(
-                cmd,
-                input=input_bytes,
-                capture_output=True,
-                check=True,
-                timeout=self.timeout,
-            )
-            audio_bytes = proc.stdout
-            if self._looks_like_text(audio_bytes):
-                preview = audio_bytes[:120].decode("utf-8", errors="replace")
-                print(
-                    "[TTS] Piper returned textual output instead of audio; "
-                    f"got: {preview!r}"
-                )
-                return None
-            if not audio_bytes:
-                print("[TTS] Piper returned no audio data")
-                return None
+            with self._piper_lock:
+                process = self._ensure_piper_process()
+                if process is None or process.stdin is None or process.stdout is None:
+                    raise RuntimeError("Piper process is unavailable")
 
-            with wave.open(str(tmp_path), "wb") as wf:
-                wf.setnchannels(info.channels or 1)
-                wf.setsampwidth(2)
-                wf.setframerate(info.sample_rate or 22050)
-                wf.writeframes(audio_bytes)
-            keep_file = True
+                self._write_to_piper(process, utterance)
+                audio_bytes = self._read_from_piper(process)
 
-            sample_rate = info.sample_rate or 22050
-            segment = SpeechSegment(
-                path=str(tmp_path),
-                raw=audio_bytes,
-                sample_rate=sample_rate,
-                channels=info.channels or 1,
-                text=utterance,
-            )
-            self.speech_queue.put(segment)
-            return segment
-
-        except subprocess.CalledProcessError as exc:
-            print(f"[TTS] Piper returned error: {exc}")
+        except TimeoutError:
+            restart_needed = True
+            print("[TTS] Piper audio stream timed out")
+        except BrokenPipeError:
+            restart_needed = True
+            print("[TTS] Piper audio stream closed unexpectedly")
         except Exception as exc:
-            print(f"[TTS] Piper failed: {exc}")
+            restart_needed = True
+            print(f"[TTS] Piper streaming failed: {exc}")
         finally:
+            if restart_needed and self.model_path.exists():
+                with self._piper_lock:
+                    self._start_piper_process()
 
+        if not audio_bytes:
+            print("[TTS] Piper returned no audio data")
             if not keep_file and tmp_path.exists():
                 try:
                     tmp_path.unlink(missing_ok=True)
-
                 except OSError:
                     pass
+            return None
+
+        if self._looks_like_text(audio_bytes):
+            preview = audio_bytes[:120].decode("utf-8", errors="replace")
+            print(
+                "[TTS] Piper returned textual output instead of audio; "
+                f"got: {preview!r}"
+            )
+            if not keep_file and tmp_path.exists():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return None
+
+        info = self._voice_info
+        with wave.open(str(tmp_path), "wb") as wf:
+            wf.setnchannels(info.channels or 1)
+            wf.setsampwidth(2)
+            wf.setframerate(info.sample_rate or 22050)
+            wf.writeframes(audio_bytes)
+        keep_file = True
+
+        sample_rate = info.sample_rate or 22050
+        segment = SpeechSegment(
+            path=str(tmp_path),
+            raw=audio_bytes,
+            sample_rate=sample_rate,
+            channels=info.channels or 1,
+            text=utterance,
+        )
+        self.speech_queue.put(segment)
+        return segment
+
         return None
 
     @staticmethod
@@ -721,6 +937,8 @@ class BufferedTTS:
         if self._playback_thread:
             self._playback_thread.join(timeout=1.0)
             self._playback_thread = None
+        with self._piper_lock:
+            self._stop_piper_process()
         self.executor.shutdown(wait=False)
 
 
@@ -1515,6 +1733,10 @@ class ModelPreloader:
 
     @staticmethod
     def warmup_llama(llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        if llama110 is None:
+            print("[WARMUP] llama110 unavailable; skipping warm-up")
+            return
+
         print("[WARMUP] Warming up llama110...")
         kwargs = llama_kwargs or {}
         try:
