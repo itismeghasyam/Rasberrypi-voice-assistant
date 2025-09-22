@@ -243,9 +243,38 @@ class ParallelSTT:
         finally:
             wav_path.unlink(missing_ok=True)
 
-        new_text = full_text
-        if emitted and full_text.lower().startswith(emitted.lower()):
-            new_text = full_text[len(emitted) :].strip()
+        collapsed_emitted = re.sub(r"\s+", " ", emitted).strip()
+        collapsed_full = re.sub(r"\s+", " ", full_text).strip()
+
+        def _lexical_tokens(text: str) -> List[str]:
+            if not text:
+                return []
+            return re.findall(r"[\w']+", text.lower())
+
+        emitted_tokens = _lexical_tokens(collapsed_emitted)
+        full_tokens = _lexical_tokens(collapsed_full)
+
+        common_len = 0
+        for emitted_token, full_token in zip(emitted_tokens, full_tokens):
+            if emitted_token != full_token:
+                break
+            common_len += 1
+
+        tokens_match_prefix = common_len == len(emitted_tokens)
+
+        new_text = full_text.strip()
+
+        if tokens_match_prefix and len(full_tokens) == len(emitted_tokens):
+            new_text = ""
+        elif tokens_match_prefix and len(full_tokens) > len(emitted_tokens):
+            token_matches = list(re.finditer(r"[\w']+", full_text))
+            if token_matches and common_len < len(token_matches):
+                start = token_matches[common_len].start()
+                new_text = full_text[start:].lstrip()
+            else:
+                new_text = full_text.strip()
+        elif not full_text:
+            new_text = ""
 
         with self._transcript_lock:
             self._emitted_transcript = full_text
