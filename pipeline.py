@@ -168,28 +168,19 @@ class BufferedTTS:
 
 
     def _loop(self) -> None:
-        """Run a persistent playback subprocess and signal when first audio is played."""
+        """FIX: Runs a single persistent playback subprocess."""
         proc = None
-        playback_started = False
         try:
             proc = subprocess.Popen(self.playback_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self._on_playback_start and proc.stdin:
+                self._on_playback_start(time.time())
 
             while self._is_running.is_set():
                 try:
                     raw = self._q.get(timeout=0.2)
-                    if raw is None:  # sentinel -> shutdown
+                    if raw is None: # Sentinel check
                         break
-
                     if proc and proc.stdin:
-                        # signal the first actual write as "playback start"
-                        if not playback_started:
-                            playback_started = True
-                            if self._on_playback_start:
-                                try:
-                                    self._on_playback_start(time.time())
-                                except Exception:
-                                    pass
-
                         proc.stdin.write(raw)
                         self._q.task_done()
                 except queue.Empty:
@@ -199,15 +190,10 @@ class BufferedTTS:
                     break
         finally:
             if proc and proc.stdin:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+                proc.stdin.close()
             if proc:
-                try:
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    pass
+                proc.wait(timeout=1.0)
+
 
     def speak_async(self, text: str) -> None:
         text = " ".join(text.split())
