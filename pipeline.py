@@ -122,6 +122,113 @@ class StreamingRecorder:
 # ================================================================
 
 
+class WarmWhisperWorker:
+    """Hold a reusable whisper.cpp context for incremental transcription."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        sample_rate: int,
+        num_threads: Optional[int] = None,
+    ) -> None:
+        try:
+            from whispercpp import Whisper, api
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("whispercpp Python bindings are unavailable") from exc
+
+        params = api.Params.from_enum(api.SAMPLING_GREEDY)
+        params = params.with_print_progress(False).with_print_realtime(False)
+        params = params.with_no_context(False)
+        if num_threads:
+            params = params.with_num_threads(max(1, int(num_threads)))
+        else:
+            params = params.with_num_threads(max(1, os.cpu_count() or 4))
+        params = params.build()
+
+        try:
+            context = api.Context.from_file(str(model_path), no_state=True)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load whisper model at {model_path}") from exc
+
+        context.reset_timings()
+
+        whisper_ref = object.__new__(Whisper)
+        whisper_ref.__dict__.update(
+            {
+                "context": context,
+                "params": params,
+                "_context_initialized": False,
+                "_transcript": [],
+            }
+        )
+
+        self._whisper = whisper_ref
+        self._audio: Optional[np.ndarray] = None
+        self._last_full: str = ""
+        self._lock = threading.Lock()
+
+    @classmethod
+    def try_create(
+        cls,
+        model_path: Path,
+        sample_rate: int,
+        num_threads: Optional[int] = None,
+    ) -> Optional["WarmWhisperWorker"]:
+        try:
+            return cls(model_path=model_path, sample_rate=sample_rate, num_threads=num_threads)
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            print(f"[STT][WarmWhisper] Unable to initialize warm whisper worker: {exc}")
+            return None
+
+    def _append_audio(self, audio_bytes: bytes) -> None:
+        if not audio_bytes:
+            return
+        audio_view = np.frombuffer(audio_bytes, dtype=np.int16)
+        if audio_view.size == 0:
+            return
+        float_chunk = audio_view.astype(np.float32) / float(np.iinfo(np.int16).max)
+        if self._audio is None:
+            self._audio = float_chunk
+        else:
+            self._audio = np.concatenate((self._audio, float_chunk))
+
+    def transcribe_chunk(self, audio_bytes: bytes) -> str:
+        with self._lock:
+            self._append_audio(audio_bytes)
+            if self._audio is None or self._audio.size == 0:
+                return self._last_full
+            try:
+                text = self._whisper.transcribe(self._audio)
+            except Exception as exc:
+                raise RuntimeError(f"whispercpp transcription failed: {exc}") from exc
+            self._last_full = (text or "").strip()
+            return self._last_full
+
+    def finalize(self) -> str:
+        with self._lock:
+            final_text = self._last_full
+            self._audio = None
+            self._last_full = ""
+            try:
+                self._whisper.context.reset_timings()
+            except Exception:
+                pass
+            try:
+                self._whisper._context_initialized = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return final_text
+
+    def reset(self) -> None:
+        self.finalize()
+
+    def shutdown(self) -> None:
+        try:
+            self._whisper.context.free()
+        except Exception:
+            pass
+
+
 class ParallelSTT:
 
     """Process audio chunks asynchronously using the whisper.cpp CLI."""
@@ -148,6 +255,14 @@ class ParallelSTT:
         self._emitted_transcript = ""
         self._last_partial = ""
         self._temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_stt_"))
+
+        self._warm_worker: Optional[WarmWhisperWorker] = None
+        if self.emit_partials:
+            self._warm_worker = WarmWhisperWorker.try_create(
+                model_path=self.whisper_model,
+                sample_rate=self.sample_rate,
+                num_threads=self.whisper_threads,
+            )
 
         if not self.whisper_exe.exists():
             raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
@@ -209,6 +324,18 @@ class ParallelSTT:
         return text
 
     def _process_chunk_whisper(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
+        if self._warm_worker is not None:
+            full_text = self._warm_worker.transcribe_chunk(audio_bytes)
+            full_text = (full_text or "").strip()
+            with self._transcript_lock:
+                previous = self._emitted_transcript
+                delta = self._compute_incremental_delta(previous, full_text)
+                self._emitted_transcript = full_text
+                self._last_partial = full_text
+            if not delta:
+                return {"chunk_id": chunk_id, "text": "", "is_final": False}
+            return {"chunk_id": chunk_id, "text": delta, "is_final": False}
+
         wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
         try:
             text = self._run_whisper(wav_path, timeout=45)
@@ -234,6 +361,13 @@ class ParallelSTT:
             self._last_partial = ""
             self._chunks.clear()
 
+        if self._warm_worker is not None:
+            full_text = (self._warm_worker.finalize() or "").strip()
+            delta = self._compute_incremental_delta(emitted, full_text)
+            with self._transcript_lock:
+                self._emitted_transcript = full_text
+            return {"chunk_id": chunk_id, "text": delta, "is_final": mark_final}
+
         if not chunks:
             return {"chunk_id": chunk_id, "text": "", "is_final": True}
 
@@ -243,53 +377,69 @@ class ParallelSTT:
         finally:
             wav_path.unlink(missing_ok=True)
 
-        collapsed_emitted = re.sub(r"\s+", " ", emitted).strip()
-        collapsed_full = re.sub(r"\s+", " ", full_text).strip()
+        delta = self._compute_incremental_delta(emitted, full_text)
+
+        with self._transcript_lock:
+            self._emitted_transcript = full_text
+
+        return {"chunk_id": chunk_id, "text": delta, "is_final": mark_final}
+
+    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
+        return {"chunk_id": chunk_id, "text": "", "is_final": False}
+
+    @staticmethod
+    def _compute_incremental_delta(previous: str, current: str) -> str:
+        collapsed_prev = re.sub(r"\s+", " ", (previous or "")).strip()
+        collapsed_current = re.sub(r"\s+", " ", (current or "")).strip()
+        if not collapsed_current:
+            return ""
 
         def _lexical_tokens(text: str) -> List[str]:
             if not text:
                 return []
             return re.findall(r"[\w']+", text.lower())
 
-        emitted_tokens = _lexical_tokens(collapsed_emitted)
-        full_tokens = _lexical_tokens(collapsed_full)
+        prev_tokens = _lexical_tokens(collapsed_prev)
+        curr_tokens = _lexical_tokens(collapsed_current)
 
         common_len = 0
-        for emitted_token, full_token in zip(emitted_tokens, full_tokens):
-            if emitted_token != full_token:
+        for prev_token, curr_token in zip(prev_tokens, curr_tokens):
+            if prev_token != curr_token:
                 break
             common_len += 1
 
-        tokens_match_prefix = common_len == len(emitted_tokens)
+        tokens_match_prefix = common_len == len(prev_tokens)
 
-        new_text = full_text.strip()
+        if tokens_match_prefix and len(curr_tokens) == len(prev_tokens):
+            return ""
 
-        if tokens_match_prefix and len(full_tokens) == len(emitted_tokens):
-            new_text = ""
-        elif tokens_match_prefix and len(full_tokens) > len(emitted_tokens):
-            token_matches = list(re.finditer(r"[\w']+", full_text))
+        if tokens_match_prefix and len(curr_tokens) > len(prev_tokens):
+            token_matches = list(re.finditer(r"[\w']+", current))
             if token_matches and common_len < len(token_matches):
                 start = token_matches[common_len].start()
-                new_text = full_text[start:].lstrip()
-            else:
-                new_text = full_text.strip()
-        elif not full_text:
-            new_text = ""
+                return current[start:].lstrip()
+            return current.strip()
 
-        with self._transcript_lock:
-            self._emitted_transcript = full_text
-
-        return {"chunk_id": chunk_id, "text": new_text, "is_final": mark_final}
-
-    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
-        return {"chunk_id": chunk_id, "text": "", "is_final": False}
+        return current.strip()
 
 
     # -------------------------- Public API -----------------------
 
-    def submit_chunk(self, audio_chunk: np.ndarray, chunk_id: int) -> Future:
+    def submit_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        chunk_id: int,
+        *,
+        skip_transcription: bool = False,
+    ) -> Future:
 
         audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
+
+        if skip_transcription:
+            future: "Future[Dict[str, Any]]" = Future()
+            future.set_result({"chunk_id": chunk_id, "text": "", "is_final": False})
+            return future
+
         with self._transcript_lock:
             self._chunks.append(audio_bytes)
 
@@ -305,11 +455,15 @@ class ParallelSTT:
             self._chunks.clear()
             self._emitted_transcript = ""
             self._last_partial = ""
+        if self._warm_worker is not None:
+            self._warm_worker.reset()
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
         with contextlib.suppress(Exception):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
+        if self._warm_worker is not None:
+            self._warm_worker.shutdown()
 
 
 # ================================================================
@@ -1098,6 +1252,8 @@ class ParallelVoiceAssistant:
         self._pending_tts_futures: Set[Future] = set()
 
         self._chunk_activity: Dict[int, bool] = {}
+        self._pending_silence_chunk_ids: Deque[int] = deque()
+        self._counted_silence_chunk_ids: Set[int] = set()
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
         self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(4.0 / max(0.1, self._chunk_duration))))
@@ -1153,6 +1309,9 @@ class ParallelVoiceAssistant:
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at = None
 
+    def _reset_pending_silence_tracking(self) -> None:
+        self._pending_silence_chunk_ids.clear()
+
     def _should_force_intermediate_transcription(self) -> bool:
         if self._stt_flush_in_progress:
             return False
@@ -1206,9 +1365,9 @@ class ParallelVoiceAssistant:
         self._activity_event.set()
 
     def _handle_silent_audio_chunk(self) -> None:
+        self._consecutive_silent_chunks += 1
         if self._stop_requested:
             return
-        self._consecutive_silent_chunks += 1
         if self._consecutive_silent_chunks < self._silent_chunks_before_stop:
             return
         if self._has_detected_speech:
@@ -1265,6 +1424,8 @@ class ParallelVoiceAssistant:
             self._stop_requested = False
             self._stop_reason = None
         self._consecutive_silent_chunks = 0
+        self._reset_pending_silence_tracking()
+        self._counted_silence_chunk_ids.clear()
         self._reset_awaiting_transcript_state()
         self._stt_flush_in_progress = False
         self._active_flush_ids.clear()
@@ -1363,17 +1524,11 @@ class ParallelVoiceAssistant:
                 # remember recorder sample rate for VAD logic if needed
                 setattr(self, "_recorder_sample_rate", self.recorder.sample_rate)
 
-                # Decide whether this chunk is silent/noisy for logging, but DO NOT call
-                # _handle_silent_audio_chunk() here. We wait for the STT result so we
-                # only count a chunk as "silent" once the model actually returns nothing
-                # useful for that chunk (avoids double-counting).
                 is_silent = self._is_silent_chunk(audio_chunk)
                 self._chunk_activity[chunk_id] = not is_silent
+                skip_transcription = False
                 if is_silent:
-                    # don't mark stop here; just log and continue to submit to STT so
-                    # the model can confirm whether it's empty/noise
-                    # (This prevents short/quiet speech from being mis-classified.)
-                    # Optional: print RMS for debugging:
+                    self._pending_silence_chunk_ids.append(chunk_id)
                     try:
                         audio_view = np.asarray(audio_chunk, dtype=np.int16)
                         if audio_view.ndim > 1:
@@ -1381,15 +1536,28 @@ class ParallelVoiceAssistant:
                         rms = float(np.sqrt(np.mean(np.square(audio_view.astype(np.float32)))))
                     except Exception:
                         rms = 0.0
-                    print(f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification")
+                    print(
+                        f"[STT] Chunk {chunk_id}: low energy (RMS {rms:.1f}), submitting to STT for verification"
+                    )
+
+                    if len(self._pending_silence_chunk_ids) >= self._silent_chunks_before_stop:
+                        for pending_chunk_id in list(self._pending_silence_chunk_ids):
+                            if pending_chunk_id in self._counted_silence_chunk_ids:
+                                continue
+                            self._counted_silence_chunk_ids.add(pending_chunk_id)
+                            self._handle_silent_audio_chunk()
+                            if self._stop_requested:
+                                break
+                    skip_transcription = True
                 else:
-                    # Mark provisional activity so the main loop can begin silence
-                    # tracking even before Whisper confirms the transcript.
+                    self._reset_pending_silence_tracking()
                     self._mark_provisional_activity(chunk_id)
 
-                # Submit to STT as usual (we rely on _process_stt_results to treat
-                # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
-                future = self.stt.submit_chunk(audio_chunk, chunk_id)
+                future = self.stt.submit_chunk(
+                    audio_chunk,
+                    chunk_id,
+                    skip_transcription=skip_transcription,
+                )
                 self.stt_futures.put((chunk_id, future, time.time()))
 
                 self.stats.stt_chunks += 1
@@ -1481,6 +1649,8 @@ class ParallelVoiceAssistant:
                         # this as silence so we still stop after the configured no-speech chunks.
                         self._reset_awaiting_transcript_state()
                         self._clear_provisional_activity(res_chunk_id)
+                        if res_chunk_id not in self._counted_silence_chunk_ids:
+                            self._counted_silence_chunk_ids.add(res_chunk_id)
                         self._handle_silent_audio_chunk()
                         continue
                     if self._should_force_intermediate_transcription():
@@ -1497,13 +1667,17 @@ class ParallelVoiceAssistant:
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
                 self._reset_awaiting_transcript_state()
                 self._clear_provisional_activity(res_chunk_id)
-                self._handle_silent_audio_chunk()
+                if res_chunk_id not in self._counted_silence_chunk_ids:
+                    self._handle_silent_audio_chunk()
+                    self._counted_silence_chunk_ids.add(res_chunk_id)
                 # We still want to surface the log, but skip registering activity and LLM trigger
                 # continue to next future
                 continue
 
             # Otherwise it's valid speech
             self._reset_awaiting_transcript_state()
+            self._counted_silence_chunk_ids.discard(res_chunk_id)
+            self._reset_pending_silence_tracking()
             self._register_activity(chunk_id=res_chunk_id)
             self._consecutive_silent_chunks = 0
 
