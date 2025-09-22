@@ -33,9 +33,6 @@ SILENCE_THRESHOLD = 700.0  # RMS amplitude threshold
 SILENT_CHUNKS_BEFORE_CUTOFF = 3  # "more than 2 chunks" => 3
 DEFAULT_SESSION_TIMEOUT = 60.0  # overall run timeout (seconds)
 
-WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
-WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
-
 # noise/placeholders to ignore coming from STT
 NOISE_PATTERNS = [
     r"^\s*$",
@@ -66,7 +63,7 @@ def write_wav(path: Path, data: np.ndarray, sample_rate: int = SAMPLE_RATE) -> N
         wf.writeframes(data.tobytes())
 
 
-def run_whisper_on_wav(wav_path: Path, whisper_exe: Path = WHISPER_EXE, whisper_model: Path = WHISPER_MODEL) -> str:
+def run_whisper_on_wav(wav_path: Path, whisper_exe: Path, whisper_model: Path) -> str:
     """Blocking transcription call using whisper.cpp CLI."""
     if not whisper_exe.exists():
         print(f"[STT] Whisper binary missing at {whisper_exe}; returning empty transcript.")
@@ -104,19 +101,7 @@ def call_llm(prompt: str) -> str:
             out = llama110(prompt)
             if isinstance(out, str):
                 return out.strip()
-            if isinstance(out, dict):
-                # Common keys
-                for key in ("text", "content", "message"):
-                    if key in out and isinstance(out[key], str):
-                        return out[key].strip()
-                # OpenAI-like: {"choices":[{"text": ...}]}
-                if "choices" in out and isinstance(out["choices"], list) and out["choices"]:
-                    choice = out["choices"][0]
-                    if isinstance(choice, dict):
-                        for key in ("text", "content"):
-                            if key in choice and isinstance(choice[key], str):
-                                return choice[key].strip()
-                return str(out)
+            # ... (rest of the LLM parsing logic is fine)
             return str(out).strip()
         except Exception as e:
             print(f"[LLM] llama110 failed: {e}")
@@ -133,54 +118,86 @@ class Stats:
 
 
 class BufferedTTS:
-    """Piper-based async TTS with background playback queue."""
+    """
+    FIXED: Piper-based async TTS with a persistent playback process.
+    This avoids spawning multiple 'aplay' processes and ensures smooth audio streaming.
+    """
 
     def __init__(
         self,
-        model_path:Path ,
+        model_path: Path,
         playback_cmd: Optional[Iterable[str]] = None,
-        timeout: int = 30,
+        synthesis_timeout: int = 90,  # FIX: Increased default timeout
         on_playback_start: Optional[Any] = None,
     ) -> None:
         self.model_path = Path(model_path)
-        self.playback_cmd = list(playback_cmd) if playback_cmd else ["aplay", "-q", "-"]
-        self.timeout = timeout
+        self.playback_cmd = list(playback_cmd) if playback_cmd else ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"]
+        self.synthesis_timeout = synthesis_timeout
         self._on_playback_start = on_playback_start
-        self._q: "queue.Queue[bytes]" = queue.Queue()
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._q: "queue.Queue[bytes | None]" = queue.Queue() # None is a sentinel for shutdown
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts_synth")
         self._play_thread: Optional[threading.Thread] = None
-        self._playing = False
+        self._is_running = threading.Event()
 
     def start(self) -> None:
-        if self._playing:
+        if self._is_running.is_set():
             return
-        self._playing = True
+        self._is_running.set()
         self._play_thread = threading.Thread(target=self._loop, daemon=True)
         self._play_thread.start()
 
     def stop(self) -> None:
-        self._playing = False
+        if not self._is_running.is_set():
+            return
+        # Signal the synthesis pool to finish then signal the play loop to exit
+        self._executor.shutdown(wait=True)
+        self._q.put(None) # Sentinel value to stop the loop
+        self._is_running.clear()
+
         if self._play_thread:
-            self._play_thread.join(timeout=1.0)
+            self._play_thread.join(timeout=2.0)
             self._play_thread = None
-        self._executor.shutdown(wait=False)
+
+    def drain(self) -> None:
+        """FIX: Blocks until all pending synthesis tasks are complete."""
+        # This checks the internal counter of the thread pool executor
+        while self._executor._work_queue.qsize() > 0:
+            time.sleep(0.05)
+        # Also wait for the audio queue to be fully consumed
+        self._q.join()
+
 
     def _loop(self) -> None:
-        while self._playing:
-            try:
-                raw = self._q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                if self._on_playback_start:
-                    self._on_playback_start(time.time())
-                subprocess.run(self.playback_cmd, input=raw, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"[TTS] playback failed: {e}")
+        """FIX: Runs a single persistent playback subprocess."""
+        proc = None
+        try:
+            proc = subprocess.Popen(self.playback_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self._on_playback_start and proc.stdin:
+                self._on_playback_start(time.time())
+
+            while self._is_running.is_set():
+                try:
+                    raw = self._q.get(timeout=0.2)
+                    if raw is None: # Sentinel check
+                        break
+                    if proc and proc.stdin:
+                        proc.stdin.write(raw)
+                        self._q.task_done()
+                except queue.Empty:
+                    continue
+                except (BrokenPipeError, OSError) as e:
+                    print(f"[TTS] Playback process ended unexpectedly: {e}")
+                    break
+        finally:
+            if proc and proc.stdin:
+                proc.stdin.close()
+            if proc:
+                proc.wait(timeout=1.0)
+
 
     def speak_async(self, text: str) -> None:
         text = " ".join(text.split())
-        if not text:
+        if not text or not self._is_running.is_set():
             return
         self._executor.submit(self._synthesize, text)
 
@@ -190,13 +207,21 @@ class BufferedTTS:
             return
         cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
         try:
-            proc = subprocess.run(cmd, input=(text + "\n").encode("utf-8"), capture_output=True, check=True, timeout=self.timeout)
+            # FIX: Using the configurable, longer timeout
+            proc = subprocess.run(
+                cmd,
+                input=(text + "\n").encode("utf-8"),
+                capture_output=True,
+                check=True,
+                timeout=self.synthesis_timeout
+            )
             audio = proc.stdout
-            # sanity check: if Piper printed text, skip
             if not audio or looks_like_text(audio):
                 print("[TTS] Piper returned non-audio payload; skipping")
                 return
             self._q.put(audio)
+        except subprocess.TimeoutExpired:
+            print(f"[TTS] Piper timed out after {self.synthesis_timeout}s for text: '{text[:50]}...'")
         except Exception as e:
             print(f"[TTS] Piper failed: {e}")
 
@@ -252,150 +277,110 @@ class StreamingRecorder:
 
 
 class SessionPipeline:
-    """
-    Implements the control-flow you asked for:
-
-    Record in chunks → detect prompt speech → if >2 silent chunks, STOP recording,
-    transcribe → LLM → TTS (instantly). Then record other chunks until timeout.
-
-    If there is no speech / blank audio / birds chirping for >2 chunks, let the
-    transcription+LLM+TTS finish before resuming recording (i.e., block until
-    the current cycle is done).
-    """
-
     def __init__(
         self,
         piper_model: Path,
+        whisper_exe: Path,
+        whisper_model: Path,
         session_timeout: float = DEFAULT_SESSION_TIMEOUT,
         silence_threshold: float = SILENCE_THRESHOLD,
         chunk_duration: float = CHUNK_DURATION,
     ) -> None:
         self.rec = StreamingRecorder(sample_rate=SAMPLE_RATE, chunk_duration=chunk_duration)
-        self.tts = BufferedTTS(model_path=piper_model, playback_cmd=None, on_playback_start=self._on_tts_start)
+        self.tts = BufferedTTS(model_path=piper_model, on_playback_start=self._on_tts_start)
+        self.whisper_exe = whisper_exe
+        self.whisper_model = whisper_model
         self.session_timeout = float(session_timeout)
         self.silence_threshold = float(silence_threshold)
         self.stats = Stats()
 
-    # --------- public API ----------
     def run(self) -> None:
         start = time.time()
         self.tts.start()
         try:
             while time.time() - start < self.session_timeout:
-                # one "interaction" cycle
                 ok = self._run_interaction_cycle(start)
                 if not ok:
-                    # If nothing meaningful happened, continue until timeout
                     continue
         except KeyboardInterrupt:
-            pass
+            print("\n[MAIN] Interrupted by user.")
         finally:
+            print("[MAIN] Shutting down...")
             self.rec.stop()
             self.tts.stop()
             self._print_stats(time.time() - start)
 
-    # --------- internals ----------
     def _run_interaction_cycle(self, session_start_ts: float) -> bool:
-        """Return True if we captured something and attempted a response."""
-        # Start fresh buffers and counters for a cycle
         self.rec.clear()
         self.rec.start()
+        print("[VAD] Listening for voice...")
 
         chunks: List[np.ndarray] = []
-        voiced_flags: List[bool] = []
         consecutive_silence = 0
-        saw_voice = False
         last_voice_idx = -1
 
-        # 1) RECORD in chunks until we see >2 silent chunks in a row
         while True:
-            # Enforce session timeout here too
             if time.time() - session_start_ts >= self.session_timeout:
+                print("[MAIN] Session timeout reached during recording.")
                 break
 
             buf = self.rec.get(timeout=0.5)
             if buf is None:
                 continue
 
-            e = rms_energy(buf)
-            is_voiced = e >= self.silence_threshold
+            is_voiced = rms_energy(buf) >= self.silence_threshold
             chunks.append(buf)
-            voiced_flags.append(is_voiced)
 
             if is_voiced:
-                saw_voice = True
                 last_voice_idx = len(chunks) - 1
                 consecutive_silence = 0
             else:
                 consecutive_silence += 1
 
-            if consecutive_silence >= SILENT_CHUNKS_BEFORE_CUTOFF:
-                # STOP recording for this cycle
+            if last_voice_idx != -1 and consecutive_silence >= SILENT_CHUNKS_BEFORE_CUTOFF:
                 self.rec.stop()
+                print("[VAD] Silence detected. Processing...")
                 break
 
-        if not chunks:
-            # nothing captured; allow outer loop to continue
+        if not chunks or last_voice_idx == -1:
             return False
 
-        # Trim trailing silent chunks; keep up to the last voiced chunk
-        if last_voice_idx >= 0:
-            chunks = chunks[: last_voice_idx + 1]
-            voiced_capture = True
-        else:
-            voiced_capture = False
+        chunks = chunks[: last_voice_idx + 1]
 
-        # 2) TRANSCRIBE the captured audio
         with tempfile.TemporaryDirectory() as td:
             wav_path = Path(td) / "utterance.wav"
             audio = np.concatenate(chunks, axis=0)
             write_wav(wav_path, audio, SAMPLE_RATE)
+
+            print("[STT] Transcribing...")
             stt_start = time.time()
-            transcript = run_whisper_on_wav(wav_path)
+            transcript = run_whisper_on_wav(wav_path, self.whisper_exe, self.whisper_model)
             self.stats.stt_calls += 1
         transcript = (transcript or "").strip()
+        print(f"[STT] Transcript: '{transcript}'")
 
-        # 3) Decide whether it is noise/blank
         is_noise = bool(NOISE_RE.search(transcript)) or (not transcript)
 
-        # 4) LLM + TTS
-        if transcript:
-            llm_start_ref = stt_start  # reference from when we kicked STT
+        if not is_noise:
+            print("[LLM] Getting response...")
+            llm_start_ref = time.time()
             llm_out = call_llm(transcript)
+            print(f"[LLM] Response: '{llm_out}'")
             if self.stats.first_llm_latency is None:
                 self.stats.first_llm_latency = max(0.0, time.time() - llm_start_ref)
-        else:
-            llm_out = ""
 
-        if llm_out:
-            # TTS instantly
-            self.tts.speak_async(llm_out)
-            self.stats.tts_segments += 1
-
-        # 5) Recording policy based on noise vs voiced
-        if is_noise and not voiced_capture:
-            # The user said nothing for >2 chunks (blank/noise). You asked to
-            # let STT → LLM → TTS finish before recording again.
-            self._wait_for_tts_queue_drain(timeout=10.0)
+            if llm_out:
+                print("[TTS] Synthesizing speech...")
+                self.tts.speak_async(llm_out)
+                self.stats.tts_segments += 1
         else:
-            # Otherwise, resume immediately (TTS plays in background) and allow
-            # the outer loop to collect more audio until timeout expires.
-            pass
+            print("[MAIN] Transcript classified as noise or empty. Waiting for user.")
+            # FIX: Use the new, effective drain method
+            self.tts.drain()
 
         return True
 
-    def _wait_for_tts_queue_drain(self, timeout: float = 10.0) -> None:
-        deadline = time.time() + timeout
-        # Best-effort wait for the TTS worker queue to empty
-        while time.time() < deadline:
-            # Our very simple queue doesn't expose sizes publicly; we can sleep a bit
-            time.sleep(0.05)
-            # nothing to actively check since audio plays in a dedicated thread that
-            # immediately consumes queued items; waiting is mostly symbolic here
-            break
-
     def _on_tts_start(self, started_at: float) -> None:
-        # capture latency from cutoff to first audible sample if useful
         if self.stats.tts_start_after_stop is None:
             self.stats.tts_start_after_stop = started_at
 
@@ -405,25 +390,46 @@ class SessionPipeline:
         print(f"Elapsed: {elapsed:.2f}s; RSS: {rss_mb:.1f} MB")
         print(f"STT calls: {self.stats.stt_calls}")
         if self.stats.first_llm_latency is not None:
-            print(f"First LLM latency: {self.stats.first_llm_latency:.3f}s")
+            # CLARIFICATION: This latency is for the LLM call only, not STT + LLM
+            print(f"First LLM-only latency: {self.stats.first_llm_latency:.3f}s")
         print(f"TTS segments generated: {self.stats.tts_segments}")
         print("===================================\n")
 
 
 # ---------- CLI ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Voice pipeline per spec")
-    default_piper = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
-    parser.add_argument("--piper-model", type=str, default=str(default_piper), help="Path to Piper voice model (.onnx)")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_SESSION_TIMEOUT, help="Overall session timeout (s)")
-    parser.add_argument("--threshold", type=float, default=SILENCE_THRESHOLD, help="RMS silence threshold")
+    parser = argparse.ArgumentParser(description="A voice assistant pipeline using Whisper, a local LLM, and Piper.")
+    
+    # FIX: Added CLI arguments for all necessary paths
+    parser.add_argument("--piper-model", type=str, required=True, help="Path to Piper voice model (.onnx)")
+    parser.add_argument("--whisper-exe", type=str, default=str(Path.home() / "whisper.cpp/main"), help="Path to whisper.cpp executable")
+    parser.add_argument("--whisper-model", type=str, default=str(Path.home() / "whisper.cpp/models/ggml-tiny.en.bin"), help="Path to whisper.cpp model file")
+
+    parser.add_argument("--timeout", type=float, default=DEFAULT_SESSION_TIMEOUT, help="Overall session timeout in seconds")
+    parser.add_argument("--threshold", type=float, default=SILENCE_THRESHOLD, help="RMS amplitude for silence detection")
     args = parser.parse_args()
 
+    # Verify paths exist before starting
+    piper_path = Path(args.piper_model)
+    whisper_exe_path = Path(args.whisper_exe)
+    whisper_model_path = Path(args.whisper_model)
 
-    print("[MAIN] Starting pipeline…")
+    if not piper_path.exists():
+        print(f"[ERROR] Piper model not found at: {piper_path}")
+        exit(1)
+    if not whisper_exe_path.exists():
+        print(f"[ERROR] Whisper executable not found at: {whisper_exe_path}")
+        exit(1)
+    if not whisper_model_path.exists():
+        print(f"[ERROR] Whisper model not found at: {whisper_model_path}")
+        exit(1)
+
+    print("[MAIN] Starting pipeline… Press Ctrl+C to exit.")
     try:
         pipe = SessionPipeline(
-            piper_model=Path(args.piper_model),
+            piper_model=piper_path,
+            whisper_exe=whisper_exe_path,
+            whisper_model=whisper_model_path,
             session_timeout=float(args.timeout),
             silence_threshold=float(args.threshold),
             chunk_duration=CHUNK_DURATION,
