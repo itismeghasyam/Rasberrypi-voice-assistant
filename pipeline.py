@@ -1042,10 +1042,9 @@ class ParallelVoiceAssistant:
 
         finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
         if finalize_future is not None:
-
-            self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
-
-            self._process_stt_results(wait=True)
+            final_chunk_id = self.stats.stt_chunks + 1
+            self.stt_futures.put((final_chunk_id, finalize_future, time.time()))
+            self._process_stt_results(wait=True, wait_for={final_chunk_id})
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
         self._stt_done.set()
@@ -1113,28 +1112,41 @@ class ParallelVoiceAssistant:
 
                 self._process_stt_results(wait=False)
 
-            self._process_stt_results(wait=True)
+            self._process_stt_results(wait=not self._stop_requested)
         finally:
             # Ensure any exceptions don't leave futures undispatched.
             pass
 
-    def _process_stt_results(self, wait: bool) -> None:
+    def _process_stt_results(self, wait: bool, wait_for: Optional[Set[int]] = None) -> None:
 
         pending: List[Tuple[int, Future, float]] = []
+        target_ids = wait_for if wait_for is not None else None
         while not self.stt_futures.empty():
             chunk_id, future, start_time = self.stt_futures.get()
 
-            if wait or future.done():
+            if future.done():
                 try:
                     result = future.result()
                 except Exception as exc:
                     print(f"[STT Pipeline] Future for chunk {chunk_id} failed: {exc}")
                     continue
             else:
+                should_wait = wait
+                if should_wait and target_ids is not None and chunk_id not in target_ids:
+                    should_wait = False
+                if should_wait and target_ids is None and self._stop_requested:
+                    should_wait = False
 
-                pending.append((chunk_id, future, start_time))
+                if not should_wait:
+                    if not future.cancel():
+                        pending.append((chunk_id, future, start_time))
+                    continue
 
-                continue
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    print(f"[STT Pipeline] Future for chunk {chunk_id} failed: {exc}")
+                    continue
 
             if not result:
                 continue
@@ -1218,8 +1230,9 @@ class ParallelVoiceAssistant:
                 reference_time = self._reference_timestamp_for_output(llm_trigger_time)
                 self.llm_futures.put((llm_future, llm_trigger_time, reference_time))
 
-
         for item in pending:
+            if self._stop_requested:
+                continue
             self.stt_futures.put(item)
 
     def _llm_pipeline(self) -> None:
