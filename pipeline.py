@@ -401,7 +401,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A voice assistant pipeline using Whisper, a local LLM, and Piper.")
     
     # FIX: Added CLI arguments for all necessary paths
-    parser.add_argument("--piper-model", type=str, required=True, help="Path to Piper voice model (.onnx)")
+    parser.add_argument("--piper-model", default= str(Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx") ,  type=str, required=True, help="Path to Piper voice model (.onnx)")
     parser.add_argument("--whisper-exe", type=str, default=str(Path.home() / "whisper.cpp/main"), help="Path to whisper.cpp executable")
     parser.add_argument("--whisper-model", type=str, default=str(Path.home() / "whisper.cpp/models/ggml-tiny.en.bin"), help="Path to whisper.cpp model file")
 
