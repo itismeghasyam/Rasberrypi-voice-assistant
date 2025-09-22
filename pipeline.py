@@ -770,7 +770,7 @@ class ParallelVoiceAssistant:
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
         whisper_threads: Optional[int] = None,
-        emit_stt_partials: bool = False,
+        emit_stt_partials: bool = True,
         piper_model_path: Path = PIPER_MODEL_PATH,
         llama_kwargs: Optional[Dict[str, Any]] = None,
 
@@ -1614,8 +1614,16 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--enable-stt-partials",
+        dest="enable_stt_partials",
         action="store_true",
+        default=True,
         help="Run whisper.cpp on each chunk for incremental transcripts",
+    )
+    parser.add_argument(
+        "--disable-stt-partials",
+        dest="enable_stt_partials",
+        action="store_false",
+        help="Disable per-chunk whisper.cpp processing until recording stops",
     )
 
     return parser.parse_args()
