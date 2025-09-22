@@ -1179,6 +1179,12 @@ class ParallelVoiceAssistant:
                     self._awaiting_transcript_chunks += 1
                     if self._awaiting_transcript_started_at is None:
                         self._awaiting_transcript_started_at = time.time()
+                    if self._awaiting_transcript_chunks >= self._silent_chunks_before_stop:
+                        # Ambient noise can keep RMS high while Whisper emits nothing; treat
+                        # this as silence so we still stop after the configured no-speech chunks.
+                        self._reset_awaiting_transcript_state()
+                        self._handle_silent_audio_chunk()
+                        continue
                     if self._should_force_intermediate_transcription():
                         elapsed = 0.0
                         if self._awaiting_transcript_started_at is not None:
