@@ -122,113 +122,6 @@ class StreamingRecorder:
 # ================================================================
 
 
-class WarmWhisperWorker:
-    """Hold a reusable whisper.cpp context for incremental transcription."""
-
-    def __init__(
-        self,
-        model_path: Path,
-        sample_rate: int,
-        num_threads: Optional[int] = None,
-    ) -> None:
-        try:
-            from whispercpp import Whisper, api
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("whispercpp Python bindings are unavailable") from exc
-
-        params = api.Params.from_enum(api.SAMPLING_GREEDY)
-        params = params.with_print_progress(False).with_print_realtime(False)
-        params = params.with_no_context(False)
-        if num_threads:
-            params = params.with_num_threads(max(1, int(num_threads)))
-        else:
-            params = params.with_num_threads(max(1, os.cpu_count() or 4))
-        params = params.build()
-
-        try:
-            context = api.Context.from_file(str(model_path), no_state=True)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load whisper model at {model_path}") from exc
-
-        context.reset_timings()
-
-        whisper_ref = object.__new__(Whisper)
-        whisper_ref.__dict__.update(
-            {
-                "context": context,
-                "params": params,
-                "_context_initialized": False,
-                "_transcript": [],
-            }
-        )
-
-        self._whisper = whisper_ref
-        self._audio: Optional[np.ndarray] = None
-        self._last_full: str = ""
-        self._lock = threading.Lock()
-
-    @classmethod
-    def try_create(
-        cls,
-        model_path: Path,
-        sample_rate: int,
-        num_threads: Optional[int] = None,
-    ) -> Optional["WarmWhisperWorker"]:
-        try:
-            return cls(model_path=model_path, sample_rate=sample_rate, num_threads=num_threads)
-        except Exception as exc:  # pragma: no cover - best-effort logging
-            print(f"[STT][WarmWhisper] Unable to initialize warm whisper worker: {exc}")
-            return None
-
-    def _append_audio(self, audio_bytes: bytes) -> None:
-        if not audio_bytes:
-            return
-        audio_view = np.frombuffer(audio_bytes, dtype=np.int16)
-        if audio_view.size == 0:
-            return
-        float_chunk = audio_view.astype(np.float32) / float(np.iinfo(np.int16).max)
-        if self._audio is None:
-            self._audio = float_chunk
-        else:
-            self._audio = np.concatenate((self._audio, float_chunk))
-
-    def transcribe_chunk(self, audio_bytes: bytes) -> str:
-        with self._lock:
-            self._append_audio(audio_bytes)
-            if self._audio is None or self._audio.size == 0:
-                return self._last_full
-            try:
-                text = self._whisper.transcribe(self._audio)
-            except Exception as exc:
-                raise RuntimeError(f"whispercpp transcription failed: {exc}") from exc
-            self._last_full = (text or "").strip()
-            return self._last_full
-
-    def finalize(self) -> str:
-        with self._lock:
-            final_text = self._last_full
-            self._audio = None
-            self._last_full = ""
-            try:
-                self._whisper.context.reset_timings()
-            except Exception:
-                pass
-            try:
-                self._whisper._context_initialized = False  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            return final_text
-
-    def reset(self) -> None:
-        self.finalize()
-
-    def shutdown(self) -> None:
-        try:
-            self._whisper.context.free()
-        except Exception:
-            pass
-
-
 class ParallelSTT:
 
     """Process audio chunks asynchronously using the whisper.cpp CLI."""
@@ -255,14 +148,10 @@ class ParallelSTT:
         self._emitted_transcript = ""
         self._last_partial = ""
         self._temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_stt_"))
+        
+        self._persistent_proc: Optional[subprocess.Popen] = None
+        self._persistent_lock = threading.Lock()
 
-        self._warm_worker: Optional[WarmWhisperWorker] = None
-        if self.emit_partials:
-            self._warm_worker = WarmWhisperWorker.try_create(
-                model_path=self.whisper_model,
-                sample_rate=self.sample_rate,
-                num_threads=self.whisper_threads,
-            )
 
         if not self.whisper_exe.exists():
             raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
@@ -283,8 +172,22 @@ class ParallelSTT:
             wf.setframerate(self.sample_rate)
             wf.writeframes(audio_bytes)
         return tmp_path
-
+    
     def _run_whisper(self, wav_path: Path, timeout: int = 60) -> str:
+        """
+        Dispatch to persistent whisper worker when partials are enabled,
+        otherwise fall back to one-shot subprocess run.
+        """
+        if self.emit_partials:   # fast path
+            text = self._run_whisper_persistent(wav_path, timeout=timeout)
+            if text:
+                return text
+
+        # fallback (safe, slower)
+        return self._run_whisper_once(wav_path, timeout=timeout)
+
+
+    def _run_whisper_once(self, wav_path: Path, timeout: int = 60) -> str:
         cmd = [
             str(self.whisper_exe),
             "-m",
@@ -322,20 +225,54 @@ class ParallelSTT:
                 break
 
         return text
+    
+    def _ensure_persistent_whisper(self) -> Optional[subprocess.Popen]:
+        if self._persistent_proc and self._persistent_proc.poll() is None:
+            return self._persistent_proc
+
+        cmd = [
+            str(self.whisper_exe),
+            "-m", str(self.whisper_model),
+            "-f", "-",          # stdin mode
+            "--no-prints",
+            "--output-txt",
+        ]
+        if self.whisper_threads:
+            cmd += ["-t", str(self.whisper_threads)]
+
+        self._persistent_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        return self._persistent_proc
+    
+    def _run_whisper_persistent(self, wav_path: Path, timeout: int = 10) -> str:
+        proc = self._ensure_persistent_whisper()
+        if not proc or not proc.stdin or not proc.stdout:
+            return ""
+
+        # feed bytes
+        try:
+            proc.stdin.write(wav_path.read_bytes())
+            proc.stdin.flush()
+        except Exception as e:
+            print("[STT] Persistent whisper write failed:", e)
+            return ""
+
+        # read back one line
+        try:
+            line = proc.stdout.readline().decode("utf-8").strip()
+            return line
+        except Exception as e:
+            print("[STT] Persistent whisper read failed:", e)
+            return ""
+
+
 
     def _process_chunk_whisper(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
-        if self._warm_worker is not None:
-            full_text = self._warm_worker.transcribe_chunk(audio_bytes)
-            full_text = (full_text or "").strip()
-            with self._transcript_lock:
-                previous = self._emitted_transcript
-                delta = self._compute_incremental_delta(previous, full_text)
-                self._emitted_transcript = full_text
-                self._last_partial = full_text
-            if not delta:
-                return {"chunk_id": chunk_id, "text": "", "is_final": False}
-            return {"chunk_id": chunk_id, "text": delta, "is_final": False}
-
         wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
         try:
             text = self._run_whisper(wav_path, timeout=45)
@@ -361,13 +298,6 @@ class ParallelSTT:
             self._last_partial = ""
             self._chunks.clear()
 
-        if self._warm_worker is not None:
-            full_text = (self._warm_worker.finalize() or "").strip()
-            delta = self._compute_incremental_delta(emitted, full_text)
-            with self._transcript_lock:
-                self._emitted_transcript = full_text
-            return {"chunk_id": chunk_id, "text": delta, "is_final": mark_final}
-
         if not chunks:
             return {"chunk_id": chunk_id, "text": "", "is_final": True}
 
@@ -377,50 +307,46 @@ class ParallelSTT:
         finally:
             wav_path.unlink(missing_ok=True)
 
-        delta = self._compute_incremental_delta(emitted, full_text)
-
-        with self._transcript_lock:
-            self._emitted_transcript = full_text
-
-        return {"chunk_id": chunk_id, "text": delta, "is_final": mark_final}
-
-    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
-        return {"chunk_id": chunk_id, "text": "", "is_final": False}
-
-    @staticmethod
-    def _compute_incremental_delta(previous: str, current: str) -> str:
-        collapsed_prev = re.sub(r"\s+", " ", (previous or "")).strip()
-        collapsed_current = re.sub(r"\s+", " ", (current or "")).strip()
-        if not collapsed_current:
-            return ""
+        collapsed_emitted = re.sub(r"\s+", " ", emitted).strip()
+        collapsed_full = re.sub(r"\s+", " ", full_text).strip()
 
         def _lexical_tokens(text: str) -> List[str]:
             if not text:
                 return []
             return re.findall(r"[\w']+", text.lower())
 
-        prev_tokens = _lexical_tokens(collapsed_prev)
-        curr_tokens = _lexical_tokens(collapsed_current)
+        emitted_tokens = _lexical_tokens(collapsed_emitted)
+        full_tokens = _lexical_tokens(collapsed_full)
 
         common_len = 0
-        for prev_token, curr_token in zip(prev_tokens, curr_tokens):
-            if prev_token != curr_token:
+        for emitted_token, full_token in zip(emitted_tokens, full_tokens):
+            if emitted_token != full_token:
                 break
             common_len += 1
 
-        tokens_match_prefix = common_len == len(prev_tokens)
+        tokens_match_prefix = common_len == len(emitted_tokens)
 
-        if tokens_match_prefix and len(curr_tokens) == len(prev_tokens):
-            return ""
+        new_text = full_text.strip()
 
-        if tokens_match_prefix and len(curr_tokens) > len(prev_tokens):
-            token_matches = list(re.finditer(r"[\w']+", current))
+        if tokens_match_prefix and len(full_tokens) == len(emitted_tokens):
+            new_text = ""
+        elif tokens_match_prefix and len(full_tokens) > len(emitted_tokens):
+            token_matches = list(re.finditer(r"[\w']+", full_text))
             if token_matches and common_len < len(token_matches):
                 start = token_matches[common_len].start()
-                return current[start:].lstrip()
-            return current.strip()
+                new_text = full_text[start:].lstrip()
+            else:
+                new_text = full_text.strip()
+        elif not full_text:
+            new_text = ""
 
-        return current.strip()
+        with self._transcript_lock:
+            self._emitted_transcript = full_text
+
+        return {"chunk_id": chunk_id, "text": new_text, "is_final": mark_final}
+
+    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
+        return {"chunk_id": chunk_id, "text": "", "is_final": False}
 
 
     # -------------------------- Public API -----------------------
@@ -455,15 +381,11 @@ class ParallelSTT:
             self._chunks.clear()
             self._emitted_transcript = ""
             self._last_partial = ""
-        if self._warm_worker is not None:
-            self._warm_worker.reset()
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
         with contextlib.suppress(Exception):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
-        if self._warm_worker is not None:
-            self._warm_worker.shutdown()
 
 
 # ================================================================
@@ -1970,12 +1892,10 @@ class ModelPreloader:
                 str(exe),
                 "-m",
                 str(model),
-                "-f",
-                str(wav_path),
+                "-f",str(wav_path),
                 "--no-prints",
                 "--output-txt",
-                "-t",
-                "1",
+                "-t","4",
             ]
             subprocess.run(cmd, capture_output=True, timeout=30)
         except Exception as exc:
