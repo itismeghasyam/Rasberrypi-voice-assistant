@@ -97,15 +97,31 @@ def run_whisper_on_wav(wav_path: Path, whisper_exe: Path = WHISPER_EXE, whisper_
 
 
 def call_llm(prompt: str) -> str:
-    if not prompt.strip():
+    if not (prompt or "").strip():
         return ""
     if llama110 is not None:
         try:
-            return (llama110(prompt) or "").strip()
+            out = llama110(prompt)
+            if isinstance(out, str):
+                return out.strip()
+            if isinstance(out, dict):
+                # Common keys
+                for key in ("text", "content", "message"):
+                    if key in out and isinstance(out[key], str):
+                        return out[key].strip()
+                # OpenAI-like: {"choices":[{"text": ...}]}
+                if "choices" in out and isinstance(out["choices"], list) and out["choices"]:
+                    choice = out["choices"][0]
+                    if isinstance(choice, dict):
+                        for key in ("text", "content"):
+                            if key in choice and isinstance(choice[key], str):
+                                return choice[key].strip()
+                return str(out)
+            return str(out).strip()
         except Exception as e:
             print(f"[LLM] llama110 failed: {e}")
     # Fallback trivial echo if no model is wired up
-    return f"You said: {prompt.strip()}"
+    return f"You said: {str(prompt).strip()}"
 
 
 @dataclass
@@ -121,7 +137,7 @@ class BufferedTTS:
 
     def __init__(
         self,
-        model_path: Path,
+        model_path:Path ,
         playback_cmd: Optional[Iterable[str]] = None,
         timeout: int = 30,
         on_playback_start: Optional[Any] = None,
@@ -397,10 +413,12 @@ class SessionPipeline:
 # ---------- CLI ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Voice pipeline per spec")
-    parser.add_argument("--piper-model", type=str, default="piper_model.pt", help="Path to Piper voice model")
+    default_piper = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
+    parser.add_argument("--piper-model", type=str, default=str(default_piper), help="Path to Piper voice model (.onnx)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_SESSION_TIMEOUT, help="Overall session timeout (s)")
     parser.add_argument("--threshold", type=float, default=SILENCE_THRESHOLD, help="RMS silence threshold")
     args = parser.parse_args()
+
 
     print("[MAIN] Starting pipeline…")
     try:
