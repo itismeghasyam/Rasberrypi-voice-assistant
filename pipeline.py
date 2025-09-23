@@ -284,6 +284,7 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         self._sample_rate = int(sample_rate)
         self._threads = max(1, int(threads or 1))
         self._buffer = np.empty(0, dtype=np.float32)
+        self._buffer_byte_length = 0
 
     def _convert_pcm(self, audio_bytes: bytes) -> np.ndarray:
         if not audio_bytes:
@@ -297,9 +298,14 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         pcm = self._convert_pcm(audio_bytes)
         if pcm.size == 0:
             return ""
-        self._buffer = np.concatenate([self._buffer, pcm])
+
+        if self._buffer.size == 0:
+            self._buffer = pcm.copy()
+        else:
+            self._buffer = np.concatenate([self._buffer, pcm])
+        self._buffer_byte_length += len(audio_bytes)
         try:
-            segments = self._model.transcribe(self._buffer, num_proc=self._threads)
+            segments = self._model.transcribe(pcm, num_proc=self._threads)
         except Exception:
             return ""
 
@@ -315,7 +321,10 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         if audio_bytes:
             pcm = self._convert_pcm(audio_bytes)
             if pcm.size:
-                self._buffer = np.concatenate([self._buffer, pcm])
+                total_bytes = len(audio_bytes)
+                if self._buffer.size == 0 or total_bytes != self._buffer_byte_length:
+                    self._buffer = pcm.copy()
+                    self._buffer_byte_length = total_bytes
         if self._buffer.size == 0:
             return ""
         try:
@@ -331,6 +340,7 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
 
     def reset(self) -> None:
         self._buffer = np.empty(0, dtype=np.float32)
+        self._buffer_byte_length = 0
 
     def shutdown(self) -> None:
         close = getattr(self._model, "close", None)
