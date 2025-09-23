@@ -823,7 +823,7 @@ class BufferedTTS:
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
-        timeout: int = 30,
+        timeout: int = 6,
 
     ) -> None:
         self.model_path = Path(model_path)
@@ -2237,7 +2237,7 @@ class ModelPreloader:
             return
         cmd = ["piper", "-m", str(model_path), "--output_file", "/tmp/piper_warmup.wav"]
         try:
-            subprocess.run(cmd, input="Warm up".encode("utf-8"), check=True, timeout=10)
+            subprocess.run(cmd, input="Warm up".encode("utf-8"), check=True, timeout=4)
         except Exception as exc:
             print(f"[WARMUP] Piper warm-up failed: {exc}")
         else:
