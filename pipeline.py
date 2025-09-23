@@ -142,12 +142,7 @@ class WarmWhisperWorker:
 
         binding: Optional[_WarmBindingProtocol] = None
 
-        try:
-            binding = cls._create_python_binding(whisper_model, sample_rate, threads)
-        except Exception as exc:
-            if os.environ.get("WARM_WHISPER_DEBUG"):
-                print(f"[WARM] Python whispercpp binding unavailable: {exc}")
-            binding = None
+        
 
         if binding is None:
             binding = cls._create_ctypes_binding(whisper_exe, whisper_model, sample_rate, threads)
@@ -207,14 +202,7 @@ class WarmWhisperWorker:
         else:
             worker_obj = library
 
-        required = ["transcribe_chunk", "finalize", "reset"]
-        if not all(hasattr(worker_obj, attr) for attr in required):
-            if os.environ.get("WARM_WHISPER_DEBUG"):
-                missing = [attr for attr in required if not hasattr(worker_obj, attr)]
-                print(f"[WARM] Missing warm whisper methods: {missing}")
-            return None
-
-        return _CtypesWarmBinding(worker_obj, library, sample_rate, threads)
+        
 
     @staticmethod
     def _resolve_library_path(whisper_exe: Path) -> Optional[Path]:
@@ -471,12 +459,8 @@ class _CtypesWarmBinding(_WarmBindingProtocol):
                 close()
 
 
-# ================================================================
+
 # Parallel Speech-to-Text (whisper.cpp)
-
-# ================================================================
-
-
 class ParallelSTT:
 
     """Process audio chunks asynchronously using the whisper.cpp CLI."""
@@ -522,11 +506,7 @@ class ParallelSTT:
                 self.sample_rate,
                 self.whisper_threads,
             )
-            if self._warm_worker is None:
-                self.emit_partials = False
-                print(
-                    "[STT][Whisper] Warm worker unavailable; disabling partial emissions"
-                )
+            
 
     # --------------------- Whisper helpers -----------------------
 
@@ -548,12 +528,12 @@ class ParallelSTT:
         Dispatch to persistent whisper worker when partials are enabled,
         otherwise fall back to one-shot subprocess run.
         """
-        if self.emit_partials:   # fast path
+        if self.emit_partials:   
             text = self._run_whisper_persistent(wav_path, timeout=timeout)
             if text:
                 return text
 
-        # fallback (safe, slower)
+        
         return self._run_whisper_once(wav_path, timeout=timeout)
 
 
@@ -2361,7 +2341,7 @@ class ModelPreloader:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
 
-    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
+    parser.add_argument("--duration", type=float, default=6.0, help="How long to run the streaming demo")
     parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
