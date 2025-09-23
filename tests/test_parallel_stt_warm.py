@@ -1,53 +1,34 @@
-<<<<<<< HEAD
-import queue
-=======
 import contextlib
 import queue
 import re
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
 import tempfile
 import threading
 import time
 import unittest
-<<<<<<< HEAD
-from pathlib import Path
-from typing import Optional
-
-import numpy as np
-from unittest import mock
-
-from pipeline import ParallelSTT, ParallelVoiceAssistant
-
-
-class FakeRecorder:
-    def __init__(self, chunks: tuple[np.ndarray, ...], sample_rate: int = 16000) -> None:
-        self.chunk_queue: "queue.Queue[np.ndarray]" = queue.Queue()
-        for chunk in chunks:
-            self.chunk_queue.put(chunk)
-        self.sample_rate = sample_rate
-        self.recording = False
-        self._stopped_at: Optional[float] = None
-=======
 import unittest.mock
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from concurrent.futures import Future
 
-from pipeline import ParallelVoiceAssistant, ParallelSTT, WarmWhisperWorker
+from pipeline import (
+    ParallelSTT,
+    ParallelVoiceAssistant,
+    WarmWhisperWorker,
+    _WhisperPythonBinding,
+)
 
 
 class FakeRecorder:
     def __init__(self, chunks: Iterable[np.ndarray], sample_rate: int = 16000) -> None:
-        prepared: List[np.ndarray] = [np.asarray(chunk, dtype=np.int16) for chunk in chunks]
+        prepared = [np.asarray(chunk, dtype=np.int16) for chunk in chunks]
         self._remaining = len(prepared)
         self.chunk_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         for chunk in prepared:
             self.chunk_queue.put(chunk)
         self.sample_rate = sample_rate
         self.recording = False
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
 
     def start(self) -> None:
         self.recording = True
@@ -59,39 +40,70 @@ class FakeRecorder:
             chunk = self.chunk_queue.get(timeout=timeout)
         except queue.Empty:
             return None
-<<<<<<< HEAD
-        if self.chunk_queue.empty():
-=======
         self._remaining = max(0, self._remaining - 1)
         if self._remaining <= 0:
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
             self.recording = False
         return chunk
 
     def clear_queue(self) -> None:
-<<<<<<< HEAD
-        while True:
-=======
         while not self.chunk_queue.empty():
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
             try:
                 self.chunk_queue.get_nowait()
             except queue.Empty:
                 break
-<<<<<<< HEAD
 
     def stop(self) -> None:
         self.recording = False
-        if self._stopped_at is None:
-            self._stopped_at = time.time()
 
 
 class FakeTTS:
-=======
-        self._remaining = 0
+    def __init__(self) -> None:
+        self.speech_queue: "queue.Queue[object]" = queue.Queue()
+        self.on_playback_start: Optional[Callable[[str, float], None]] = None
+        self.on_playback_error: Optional[Callable[[], None]] = None
+
+    def start_playback(self) -> None:
+        pass
 
     def stop(self) -> None:
-        self.recording = False
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def generate_and_queue(self, text: str, segment_id: int):
+        future: "Future[object]" = Future()
+        future.set_result({"text": text, "segment_id": segment_id})
+        callback = getattr(self, "on_playback_start", None)
+        if callable(callback):
+            def _fire_callback() -> None:
+                time.sleep(0.01)
+                callback(f"segment_{segment_id}.wav", time.time())
+
+            threading.Thread(target=_fire_callback, daemon=True).start()
+        return future
+
+
+class RespondingLLM:
+    def __init__(self, response: str, delay: float = 0.05) -> None:
+        self._response = response
+        self._delay = delay
+
+    def process_incremental(self, text: str, is_final: bool = False):
+        if not text.strip():
+            return None
+
+        future: "Future[str]" = Future()
+
+        def _resolve() -> None:
+            time.sleep(self._delay)
+            future.set_result(self._response)
+
+        threading.Thread(target=_resolve, daemon=True).start()
+        return future
+
+    def shutdown(self) -> None:
+        pass
 
 
 class DummyLLM:
@@ -117,11 +129,10 @@ class DummyLLM:
 
 
 class DummyTTS:
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
     def __init__(self) -> None:
         self.speech_queue: "queue.Queue[object]" = queue.Queue()
-        self.on_playback_start = None
-        self.on_playback_error = None
+        self.on_playback_start: Optional[Callable[[str, float], None]] = None
+        self.on_playback_error: Optional[Callable[[], None]] = None
 
     def start_playback(self) -> None:
         pass
@@ -132,46 +143,8 @@ class DummyTTS:
     def shutdown(self) -> None:
         pass
 
-<<<<<<< HEAD
-    def generate_and_queue(self, text: str, segment_id: int):
-        from concurrent.futures import Future
-
-        future: "Future[object]" = Future()
-        future.set_result({"text": text, "segment_id": segment_id})
-        callback = getattr(self, "on_playback_start", None)
-
-        if callable(callback):
-
-            def _fire_callback() -> None:
-                time.sleep(0.01)
-                callback(f"segment_{segment_id}.wav", time.time())
-
-            threading.Thread(target=_fire_callback, daemon=True).start()
-        return future
-
-
-class RespondingLLM:
-    def __init__(self, response: str, delay: float = 0.05) -> None:
-        self._response = response
-        self._delay = delay
-
-    def process_incremental(self, text: str, is_final: bool = False):
-        if not text.strip():
-            return None
-
-        from concurrent.futures import Future
-
-        future: "Future[str]" = Future()
-
-        def _resolve() -> None:
-            time.sleep(self._delay)
-            future.set_result(self._response)
-
-        threading.Thread(target=_resolve, daemon=True).start()
-        return future
-
-    def shutdown(self) -> None:
-        pass
+    def generate_and_queue(self, _text: str, _segment_id: int):
+        return None
 
 
 class FakeWarmWorker:
@@ -180,15 +153,15 @@ class FakeWarmWorker:
         self.finalize_calls = 0
         self._current = ""
 
-    def transcribe_chunk(self, _audio_bytes: bytes) -> str:
+    def transcribe_chunk(self, _audio_bytes: bytes, chunk_id: int) -> str:
         self.transcribe_calls += 1
-        if self.transcribe_calls == 1:
+        if chunk_id == 0:
             self._current = "hello there."
         else:
-            self._current = "hello there."
+            self._current = ""
         return self._current
 
-    def finalize(self) -> str:
+    def finalize(self, _audio_bytes: Optional[bytes]) -> str:
         self.finalize_calls += 1
         return self._current
 
@@ -210,10 +183,8 @@ class SlowSTT:
         chunk_id: int,
         *,
         skip_transcription: bool = False,
-    ):
-        from concurrent.futures import Future
-
-        future: "Future[dict[str, object]]" = Future()
+    ) -> Future:
+        future: "Future[Dict[str, object]]" = Future()
         future.set_running_or_notify_cancel()
 
         if skip_transcription:
@@ -231,7 +202,7 @@ class SlowSTT:
         threading.Thread(target=_resolve, daemon=True).start()
         return future
 
-    def finalize(self, *_args, **_kwargs):
+    def finalize(self, *_args, **_kwargs) -> None:
         return None
 
     def reset(self) -> None:
@@ -239,6 +210,37 @@ class SlowSTT:
 
     def shutdown(self) -> None:
         pass
+
+
+class FakeWarmBinding:
+    def __init__(self, library: "FakeWarmLibrary") -> None:
+        self.library = library
+        self.transcribed: List[int] = []
+
+    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int, sample_rate: int) -> str:
+        self.library.chunk_calls.append(chunk_id)
+        self.transcribed.append(chunk_id)
+        return f"chunk-{chunk_id}"
+
+    def finalize(self, audio_bytes: Optional[bytes], sample_rate: int) -> str:
+        return " ".join(f"chunk-{cid}" for cid in self.transcribed)
+
+    def reset(self) -> None:
+        self.transcribed.clear()
+
+
+class FakeWarmLibrary:
+    def __init__(self) -> None:
+        self.creations = 0
+        self.chunk_calls: List[int] = []
+        self.destroyed = 0
+
+    def warm_whisper_create_worker(self, model_path: str, sample_rate: int, threads: int):
+        self.creations += 1
+        return FakeWarmBinding(self)
+
+    def warm_whisper_destroy_worker(self, worker: FakeWarmBinding) -> None:
+        self.destroyed += 1
 
 
 class WarmWhisperIntegrationTest(unittest.TestCase):
@@ -290,43 +292,74 @@ class WarmWhisperIntegrationTest(unittest.TestCase):
 
         speech = (np.ones(int(0.05 * 16000), dtype=np.int16) * 2000).astype(np.int16)
 
-        with mock.patch("pipeline.WarmWhisperWorker.try_create", return_value=worker), mock.patch.object(
+        with unittest.mock.patch(
+            "pipeline.WarmWhisperWorker.try_create", return_value=worker
+        ), unittest.mock.patch.object(
             ParallelSTT, "_run_whisper", side_effect=AssertionError("should not call whisper-cli")
         ):
-=======
-    def generate_and_queue(self, _text: str, _segment_id: int):
-        return None
+            stt = ParallelSTT(
+                num_workers=1,
+                sample_rate=16000,
+                whisper_exe=self.whisper_exe,
+                whisper_model=self.whisper_model,
+                emit_partials=True,
+            )
 
+            first = stt.submit_chunk(speech, 0)
+            second = stt.submit_chunk(speech, 1)
 
-class FakeWarmBinding:
-    def __init__(self, library: "FakeWarmLibrary") -> None:
-        self.library = library
-        self.transcribed: List[int] = []
+            first_result = first.result(timeout=1.0)
+            second_result = second.result(timeout=1.0)
 
-    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int, sample_rate: int) -> str:
-        self.library.chunk_calls.append(chunk_id)
-        self.transcribed.append(chunk_id)
-        return f"chunk-{chunk_id}"
+            finalize_future = stt.finalize(2, mark_final=True)
+            assert finalize_future is not None
+            finalize_result = finalize_future.result(timeout=1.0)
 
-    def finalize(self, audio_bytes: Optional[bytes], sample_rate: int) -> str:
-        return " ".join(f"chunk-{cid}" for cid in self.transcribed)
+            stt.shutdown()
 
-    def reset(self) -> None:
-        self.transcribed.clear()
+        self.assertEqual(worker.transcribe_calls, 2)
+        self.assertEqual(worker.finalize_calls, 1)
+        self.assertEqual(first_result.get("text"), "hello there.")
+        self.assertEqual(second_result.get("text"), "")
+        self.assertEqual(finalize_result.get("text"), "")
 
+    def test_warm_worker_reduces_recording_to_first_llm_latency(self) -> None:
+        speech = (np.ones(int(0.05 * 16000), dtype=np.int16) * 2500).astype(np.int16)
+        warm_recorder = FakeRecorder((speech,))
+        cold_recorder = FakeRecorder((speech,))
 
-class FakeWarmLibrary:
-    def __init__(self) -> None:
-        self.creations = 0
-        self.chunk_calls: List[int] = []
-        self.destroyed = 0
+        worker = FakeWarmWorker()
 
-    def warm_whisper_create_worker(self, model_path: str, sample_rate: int, threads: int):
-        self.creations += 1
-        return FakeWarmBinding(self)
+        with unittest.mock.patch(
+            "pipeline.WarmWhisperWorker.try_create", return_value=worker
+        ), unittest.mock.patch.object(
+            ParallelSTT,
+            "_run_whisper",
+            side_effect=AssertionError("should not invoke CLI when warm worker is active"),
+        ):
+            warm_assistant = self._build_assistant(warm_recorder)
+            start = time.time()
+            warm_assistant.run(duration=1.5)
+            warm_elapsed = time.time() - start
+            warm_latency = warm_assistant.stats.recording_to_first_llm_latency
 
-    def warm_whisper_destroy_worker(self, worker: FakeWarmBinding) -> None:
-        self.destroyed += 1
+        self.assertIsNotNone(warm_latency)
+        assert warm_latency is not None
+        self.assertLess(warm_elapsed, 1.5)
+
+        cold_stt = SlowSTT(delay=0.05)
+        cold_assistant = self._build_assistant(
+            cold_recorder, stt_override=cold_stt, silence_timeout=1.2
+        )
+        start = time.time()
+        cold_assistant.run(duration=1.5)
+        cold_elapsed = time.time() - start
+        cold_latency = cold_assistant.stats.recording_to_first_llm_latency
+
+        self.assertIsNotNone(cold_latency)
+        assert cold_latency is not None
+        self.assertLess(cold_elapsed, 1.6)
+        self.assertGreater(cold_latency, warm_latency + 0.03)
 
 
 class WarmFallbackTestCase(unittest.TestCase):
@@ -388,7 +421,9 @@ class WarmFallbackTestCase(unittest.TestCase):
         if use_warm:
             context_managers.append(unittest.mock.patch("pipeline.ctypes.CDLL", return_value=library))
         else:
-            context_managers.append(unittest.mock.patch.object(WarmWhisperWorker, "try_create", return_value=None))
+            context_managers.append(
+                unittest.mock.patch.object(WarmWhisperWorker, "try_create", return_value=None)
+            )
 
         with contextlib.ExitStack() as stack:
             for cm in context_managers:
@@ -438,71 +473,11 @@ class WarmFallbackTestCase(unittest.TestCase):
             for cm in patches:
                 stack.enter_context(cm)
 
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
             stt = ParallelSTT(
                 num_workers=1,
                 sample_rate=16000,
                 whisper_exe=self.whisper_exe,
                 whisper_model=self.whisper_model,
-<<<<<<< HEAD
-                emit_partials=True,
-            )
-
-            first = stt.submit_chunk(speech, 0)
-            second = stt.submit_chunk(speech, 1)
-
-            first_result = first.result(timeout=1.0)
-            second_result = second.result(timeout=1.0)
-
-            finalize_future = stt.finalize(2, mark_final=True)
-            assert finalize_future is not None
-            finalize_result = finalize_future.result(timeout=1.0)
-
-            stt.shutdown()
-
-        self.assertEqual(worker.transcribe_calls, 2)
-        self.assertEqual(worker.finalize_calls, 1)
-        self.assertEqual(first_result.get("text"), "hello there.")
-        self.assertEqual(second_result.get("text"), "")
-        self.assertEqual(finalize_result.get("text"), "")
-
-    def test_warm_worker_reduces_recording_to_first_llm_latency(self) -> None:
-        speech = (np.ones(int(0.05 * 16000), dtype=np.int16) * 2500).astype(np.int16)
-        warm_recorder = FakeRecorder((speech,))
-        cold_recorder = FakeRecorder((speech,))
-
-        worker = FakeWarmWorker()
-
-        with mock.patch("pipeline.WarmWhisperWorker.try_create", return_value=worker), mock.patch.object(
-            ParallelSTT, "_run_whisper", side_effect=AssertionError("should not invoke CLI when warm worker is active")
-        ):
-            warm_assistant = self._build_assistant(warm_recorder)
-            start = time.time()
-            warm_assistant.run(duration=1.5)
-            warm_elapsed = time.time() - start
-            warm_latency = warm_assistant.stats.recording_to_first_llm_latency
-
-        self.assertIsNotNone(warm_latency)
-        assert warm_latency is not None
-        self.assertLess(warm_elapsed, 1.5)
-
-        cold_stt = SlowSTT(delay=0.05)
-        cold_assistant = self._build_assistant(
-            cold_recorder, stt_override=cold_stt, silence_timeout=1.2
-        )
-        start = time.time()
-        cold_assistant.run(duration=1.5)
-        cold_elapsed = time.time() - start
-        cold_latency = cold_assistant.stats.recording_to_first_llm_latency
-
-        self.assertIsNotNone(cold_latency)
-        assert cold_latency is not None
-        self.assertLess(cold_elapsed, 1.6)
-        self.assertGreater(cold_latency, warm_latency + 0.03)
-
-
-if __name__ == "__main__":  # pragma: no cover
-=======
                 whisper_threads=1,
                 emit_partials=True,
             )
@@ -532,6 +507,47 @@ if __name__ == "__main__":  # pragma: no cover
         self.assertGreater(cli_latency, 0.0)
 
 
-if __name__ == "__main__":
->>>>>>> a49d41338211c5b2566cbb668fce64e98358e935
+class WhisperPythonBindingTestCase(unittest.TestCase):
+    def test_transcribe_chunk_uses_incremental_audio(self) -> None:
+        class CountingModel:
+            def __init__(self) -> None:
+                self.calls: List[int] = []
+
+            def transcribe(self, audio: np.ndarray, num_proc: int = 1) -> str:
+                self.calls.append(len(audio))
+                return f"call-{len(self.calls)}"
+
+        model = CountingModel()
+        binding = _WhisperPythonBinding(model, sample_rate=16000, threads=2)
+
+        chunk_one = (np.arange(6, dtype=np.int16) * 10).astype(np.int16)
+        chunk_two = (np.arange(4, dtype=np.int16) * -20).astype(np.int16)
+
+        text1 = binding.transcribe_chunk(chunk_one.tobytes(), 0)
+        text2 = binding.transcribe_chunk(chunk_two.tobytes(), 1)
+        final = binding.finalize(None)
+
+        self.assertEqual(text1, "call-1")
+        self.assertEqual(text2, "call-2")
+        self.assertEqual(final, "call-3")
+        self.assertEqual(
+            model.calls,
+            [
+                len(chunk_one),
+                len(chunk_two),
+                len(np.concatenate([chunk_one, chunk_two])),
+            ],
+        )
+
+        binding.reset()
+        text3 = binding.transcribe_chunk(chunk_two.tobytes(), 2)
+        final_after_reset = binding.finalize(None)
+
+        self.assertEqual(text3, "call-4")
+        self.assertEqual(final_after_reset, "call-5")
+        self.assertEqual(len(model.calls), 5)
+        self.assertEqual(model.calls[-2:], [len(chunk_two), len(chunk_two)])
+
+
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()
