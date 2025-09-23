@@ -522,6 +522,11 @@ class ParallelSTT:
                 self.sample_rate,
                 self.whisper_threads,
             )
+            if self._warm_worker is None:
+                self.emit_partials = False
+                print(
+                    "[STT][Whisper] Warm worker unavailable; disabling partial emissions"
+                )
 
     # --------------------- Whisper helpers -----------------------
 
