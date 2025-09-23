@@ -286,6 +286,9 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         self._buffer = np.empty(0, dtype=np.float32)
         self._buffer_byte_length = 0
 
+        self._aggregated_text = ""
+
+
     def _convert_pcm(self, audio_bytes: bytes) -> np.ndarray:
         if not audio_bytes:
             return np.empty(0, dtype=np.float32)
@@ -293,6 +296,69 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         if pcm.size == 0:
             return np.empty(0, dtype=np.float32)
         return pcm.astype(np.float32) / 32768.0
+
+    def _extract_text(self, segments: Any) -> str:
+        if isinstance(segments, str):
+            return segments
+        try:
+            return " ".join(getattr(seg, "text", "") for seg in segments).strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        if not text:
+            return ""
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _lexical_tokens(text: str) -> List[str]:
+        if not text:
+            return []
+        return re.findall(r"[\w']+", text.lower())
+
+    def _compute_incremental_text(self, previous: str, current: str) -> str:
+        current = current or ""
+        previous = previous or ""
+
+        normalized_previous = self._normalize_whitespace(previous)
+        normalized_current = self._normalize_whitespace(current)
+
+        if not normalized_current:
+            return ""
+
+        previous_tokens = self._lexical_tokens(normalized_previous)
+        current_tokens = self._lexical_tokens(normalized_current)
+
+        common_len = 0
+        for prev_token, curr_token in zip(previous_tokens, current_tokens):
+            if prev_token != curr_token:
+                break
+            common_len += 1
+
+        if common_len >= len(current_tokens):
+            return ""
+
+        matches = list(re.finditer(r"[\w']+", current))
+        if common_len < len(matches):
+            start = matches[common_len].start()
+            return current[start:].lstrip()
+
+        return current.strip()
+
+    def _merge_with_increment(self, existing: str, addition: str) -> str:
+        existing = (existing or "").strip()
+        addition = (addition or "").strip()
+        if not addition:
+            return existing
+        if not existing:
+            return addition
+
+        tentative = f"{existing} {addition}".strip()
+        increment = self._compute_incremental_text(existing, tentative)
+        if not increment:
+            return existing
+        return f"{existing} {increment}".strip()
 
     def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int) -> str:
         pcm = self._convert_pcm(audio_bytes)
@@ -304,18 +370,29 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
         else:
             self._buffer = np.concatenate([self._buffer, pcm])
         self._buffer_byte_length += len(audio_bytes)
+
+        candidate_full_text = self._aggregated_text
+
         try:
             segments = self._model.transcribe(pcm, num_proc=self._threads)
         except Exception:
-            return ""
+            segments = ""
 
-        if isinstance(segments, str):
-            return segments
+        primary_text = self._extract_text(segments).strip()
+        if primary_text:
+            candidate_full_text = self._merge_with_increment(self._aggregated_text, primary_text)
+        else:
+            try:
+                fallback_segments = self._model.transcribe(self._buffer, num_proc=self._threads)
+            except Exception:
+                fallback_segments = ""
+            fallback_text = self._extract_text(fallback_segments).strip()
+            if fallback_text:
+                candidate_full_text = fallback_text
 
-        try:
-            return " ".join(getattr(seg, "text", "") for seg in segments).strip()
-        except Exception:
-            return ""
+        new_text = self._compute_incremental_text(self._aggregated_text, candidate_full_text)
+        self._aggregated_text = candidate_full_text
+        return new_text
 
     def finalize(self, audio_bytes: Optional[bytes]) -> str:
         if audio_bytes:
@@ -326,21 +403,22 @@ class _WhisperPythonBinding(_WarmBindingProtocol):
                     self._buffer = pcm.copy()
                     self._buffer_byte_length = total_bytes
         if self._buffer.size == 0:
+            self._aggregated_text = ""
             return ""
         try:
             segments = self._model.transcribe(self._buffer, num_proc=self._threads)
         except Exception:
             return ""
-        if isinstance(segments, str):
-            return segments
-        try:
-            return " ".join(getattr(seg, "text", "") for seg in segments).strip()
-        except Exception:
-            return ""
+        final_text = self._extract_text(segments).strip()
+        self._aggregated_text = final_text
+        return final_text
 
     def reset(self) -> None:
         self._buffer = np.empty(0, dtype=np.float32)
         self._buffer_byte_length = 0
+
+        self._aggregated_text = ""
+
 
     def shutdown(self) -> None:
         close = getattr(self._model, "close", None)
