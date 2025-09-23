@@ -6,6 +6,7 @@ import argparse
 import errno
 
 import contextlib
+import ctypes
 import json
 import math
 import os
@@ -113,7 +114,273 @@ class StreamingRecorder:
         self.recording = False
         if self._thread:
             self._thread.join(timeout=1.0)
-            self._thread = None
+        self._thread = None
+
+
+# ================================================================
+# Warm Whisper Worker (whisper.cpp bindings)
+# ================================================================
+
+
+class WarmWhisperWorker:
+    """Provide a persistent whisper.cpp worker for chunked transcription."""
+
+    def __init__(self, binding: "_WarmBindingProtocol", sample_rate: int) -> None:
+        self._binding = binding
+        self._sample_rate = int(sample_rate)
+        self._lock = threading.Lock()
+
+    @classmethod
+    def try_create(
+        cls,
+        whisper_exe: Path,
+        whisper_model: Path,
+        sample_rate: int,
+        threads: Optional[int] = None,
+    ) -> Optional["WarmWhisperWorker"]:
+        """Attempt to construct a warm worker using python bindings or ctypes."""
+
+        binding: Optional[_WarmBindingProtocol] = None
+
+        try:
+            binding = cls._create_python_binding(whisper_model, sample_rate, threads)
+        except Exception as exc:
+            if os.environ.get("WARM_WHISPER_DEBUG"):
+                print(f"[WARM] Python whispercpp binding unavailable: {exc}")
+            binding = None
+
+        if binding is None:
+            binding = cls._create_ctypes_binding(whisper_exe, whisper_model, sample_rate, threads)
+
+        if binding is None:
+            return None
+
+        return cls(binding, sample_rate)
+
+    @staticmethod
+    def _create_python_binding(
+        whisper_model: Path, sample_rate: int, threads: Optional[int]
+    ) -> Optional["_WarmBindingProtocol"]:
+        try:
+            from whispercpp import Whisper  # type: ignore[import]
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("whispercpp python binding not available") from exc
+
+        try:
+            model = Whisper.from_pretrained(
+                whisper_model.name,
+                basedir=str(whisper_model.parent),
+            )
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("whispercpp model load failed") from exc
+
+        return _WhisperPythonBinding(model, sample_rate, threads)
+
+    @classmethod
+    def _create_ctypes_binding(
+        cls,
+        whisper_exe: Path,
+        whisper_model: Path,
+        sample_rate: int,
+        threads: Optional[int],
+    ) -> Optional["_WarmBindingProtocol"]:
+        lib_path = cls._resolve_library_path(whisper_exe)
+        if lib_path is None:
+            return None
+
+        try:
+            library = ctypes.CDLL(str(lib_path))
+        except OSError as exc:
+            if os.environ.get("WARM_WHISPER_DEBUG"):
+                print(f"[WARM] Failed loading {lib_path}: {exc}")
+            return None
+
+        worker_obj: Any
+        create_fn = getattr(library, "warm_whisper_create_worker", None)
+        if callable(create_fn):
+            try:
+                worker_obj = create_fn(str(whisper_model), int(sample_rate), int(threads or 0))
+            except Exception as exc:
+                if os.environ.get("WARM_WHISPER_DEBUG"):
+                    print(f"[WARM] warm_whisper_create_worker failed: {exc}")
+                return None
+        else:
+            worker_obj = library
+
+        required = ["transcribe_chunk", "finalize", "reset"]
+        if not all(hasattr(worker_obj, attr) for attr in required):
+            if os.environ.get("WARM_WHISPER_DEBUG"):
+                missing = [attr for attr in required if not hasattr(worker_obj, attr)]
+                print(f"[WARM] Missing warm whisper methods: {missing}")
+            return None
+
+        return _CtypesWarmBinding(worker_obj, library, sample_rate, threads)
+
+    @staticmethod
+    def _resolve_library_path(whisper_exe: Path) -> Optional[Path]:
+        env_vars = [
+            os.environ.get("WHISPER_CPP_LIB"),
+            os.environ.get("WHISPER_LIBWHISPER_PATH"),
+            os.environ.get("WHISPER_LIB"),
+        ]
+        for candidate in env_vars:
+            if not candidate:
+                continue
+            path = Path(candidate)
+            if path.exists():
+                return path
+
+        exe_path = Path(whisper_exe)
+        search_roots = [exe_path.parent, exe_path.parent.parent]
+        if exe_path.parent.parent != exe_path.parent:
+            search_roots.append(exe_path.parent.parent.parent)
+        search_roots = [p for p in search_roots if p and p.exists()]
+
+        lib_names = ["libwhisper.so", "libwhisper.dylib", "whisper.dll", "libwarmwhisper.so"]
+        for root in search_roots:
+            for variant in [root, root / "lib", root / "bin"]:
+                if not variant.exists():
+                    continue
+                for name in lib_names:
+                    candidate = variant / name
+                    if candidate.exists():
+                        return candidate
+        return None
+
+    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int) -> str:
+        with self._lock:
+            return self._binding.transcribe_chunk(audio_bytes, chunk_id)
+
+    def finalize(self, audio_bytes: Optional[bytes]) -> str:
+        with self._lock:
+            return self._binding.finalize(audio_bytes)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._binding.reset()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._binding.shutdown()
+
+
+class _WarmBindingProtocol:
+    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int) -> str:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+    def finalize(self, audio_bytes: Optional[bytes]) -> str:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+    def reset(self) -> None:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+    def shutdown(self) -> None:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+
+class _WhisperPythonBinding(_WarmBindingProtocol):
+    def __init__(self, model: Any, sample_rate: int, threads: Optional[int]) -> None:
+        self._model = model
+        self._sample_rate = int(sample_rate)
+        self._threads = max(1, int(threads or 1))
+        self._buffer = np.empty(0, dtype=np.float32)
+
+    def _convert_pcm(self, audio_bytes: bytes) -> np.ndarray:
+        if not audio_bytes:
+            return np.empty(0, dtype=np.float32)
+        pcm = np.frombuffer(audio_bytes, dtype=np.int16)
+        if pcm.size == 0:
+            return np.empty(0, dtype=np.float32)
+        return pcm.astype(np.float32) / 32768.0
+
+    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int) -> str:
+        pcm = self._convert_pcm(audio_bytes)
+        if pcm.size == 0:
+            return ""
+        self._buffer = np.concatenate([self._buffer, pcm])
+        try:
+            segments = self._model.transcribe(self._buffer, num_proc=self._threads)
+        except Exception:
+            return ""
+
+        if isinstance(segments, str):
+            return segments
+
+        try:
+            return " ".join(getattr(seg, "text", "") for seg in segments).strip()
+        except Exception:
+            return ""
+
+    def finalize(self, audio_bytes: Optional[bytes]) -> str:
+        if audio_bytes:
+            pcm = self._convert_pcm(audio_bytes)
+            if pcm.size:
+                self._buffer = np.concatenate([self._buffer, pcm])
+        if self._buffer.size == 0:
+            return ""
+        try:
+            segments = self._model.transcribe(self._buffer, num_proc=self._threads)
+        except Exception:
+            return ""
+        if isinstance(segments, str):
+            return segments
+        try:
+            return " ".join(getattr(seg, "text", "") for seg in segments).strip()
+        except Exception:
+            return ""
+
+    def reset(self) -> None:
+        self._buffer = np.empty(0, dtype=np.float32)
+
+    def shutdown(self) -> None:
+        close = getattr(self._model, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
+
+class _CtypesWarmBinding(_WarmBindingProtocol):
+    def __init__(
+        self,
+        worker: Any,
+        library: Any,
+        sample_rate: int,
+        threads: Optional[int],
+    ) -> None:
+        self._worker = worker
+        self._library = library
+        self._sample_rate = int(sample_rate)
+        self._threads = int(threads or 0)
+
+    def transcribe_chunk(self, audio_bytes: bytes, chunk_id: int) -> str:
+        if hasattr(self._worker, "transcribe_chunk"):
+            return str(
+                self._worker.transcribe_chunk(audio_bytes, int(chunk_id), self._sample_rate)
+            )
+        if hasattr(self._worker, "transcribe"):
+            return str(self._worker.transcribe(audio_bytes, int(chunk_id), self._sample_rate))
+        raise RuntimeError("warm whisper binding lacks a transcribe function")
+
+    def finalize(self, audio_bytes: Optional[bytes]) -> str:
+        if hasattr(self._worker, "finalize"):
+            return str(self._worker.finalize(audio_bytes, self._sample_rate))
+        return ""
+
+    def reset(self) -> None:
+        if hasattr(self._worker, "reset"):
+            self._worker.reset()
+
+    def shutdown(self) -> None:
+        destroy = getattr(self._library, "warm_whisper_destroy_worker", None)
+        if callable(destroy):
+            with contextlib.suppress(Exception):
+                destroy(self._worker)
+            return
+
+        close = getattr(self._worker, "close", None) or getattr(self._worker, "destroy", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
 
 
 # ================================================================
@@ -143,6 +410,8 @@ class ParallelSTT:
         self.whisper_threads = int(whisper_threads) if whisper_threads else None
         self.emit_partials = bool(emit_partials)
 
+        self._warm_worker: Optional[WarmWhisperWorker] = None
+
         self._chunks: List[bytes] = []
         self._transcript_lock = threading.Lock()
         self._emitted_transcript = ""
@@ -157,6 +426,14 @@ class ParallelSTT:
             raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
         if not self.whisper_model.exists():
             raise FileNotFoundError(f"Whisper model not found: {self.whisper_model}")
+
+        if self.emit_partials:
+            self._warm_worker = WarmWhisperWorker.try_create(
+                self.whisper_exe,
+                self.whisper_model,
+                self.sample_rate,
+                self.whisper_threads,
+            )
 
     # --------------------- Whisper helpers -----------------------
 
@@ -273,11 +550,19 @@ class ParallelSTT:
 
 
     def _process_chunk_whisper(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
-        wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
-        try:
-            text = self._run_whisper(wav_path, timeout=45)
-        finally:
-            wav_path.unlink(missing_ok=True)
+        text: str = ""
+        if self._warm_worker is not None:
+            try:
+                text = self._warm_worker.transcribe_chunk(audio_bytes, chunk_id)
+            except Exception as exc:
+                print(f"[STT][Whisper] Warm worker chunk {chunk_id} failed: {exc}")
+                text = ""
+        else:
+            wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
+            try:
+                text = self._run_whisper(wav_path, timeout=45)
+            finally:
+                wav_path.unlink(missing_ok=True)
 
         text = (text or "").strip()
         if not text:
@@ -301,11 +586,19 @@ class ParallelSTT:
         if not chunks:
             return {"chunk_id": chunk_id, "text": "", "is_final": True}
 
-        wav_path = self._write_wav(b"".join(chunks), f"session{chunk_id}")
-        try:
-            full_text = (self._run_whisper(wav_path, timeout=120) or "").strip()
-        finally:
-            wav_path.unlink(missing_ok=True)
+        full_text = ""
+        if self._warm_worker is not None:
+            try:
+                full_text = (self._warm_worker.finalize(b"".join(chunks)) or "").strip()
+            except Exception as exc:
+                print(f"[STT][Whisper] Warm worker finalize failed: {exc}")
+                full_text = ""
+        else:
+            wav_path = self._write_wav(b"".join(chunks), f"session{chunk_id}")
+            try:
+                full_text = (self._run_whisper(wav_path, timeout=120) or "").strip()
+            finally:
+                wav_path.unlink(missing_ok=True)
 
         collapsed_emitted = re.sub(r"\s+", " ", emitted).strip()
         collapsed_full = re.sub(r"\s+", " ", full_text).strip()
@@ -381,8 +674,12 @@ class ParallelSTT:
             self._chunks.clear()
             self._emitted_transcript = ""
             self._last_partial = ""
+        if self._warm_worker is not None:
+            self._warm_worker.reset()
 
     def shutdown(self) -> None:
+        if self._warm_worker is not None:
+            self._warm_worker.shutdown()
         self.executor.shutdown(wait=False)
         with contextlib.suppress(Exception):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
