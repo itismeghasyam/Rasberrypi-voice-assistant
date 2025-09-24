@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from pipeline import ParallelVoiceAssistant
+from pipeline.pipeline import ParallelVoiceAssistant
 
 
 class FakeRecorder:

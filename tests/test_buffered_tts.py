@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline import BufferedTTS
+from pipeline.pipeline import BufferedTTS
 
 
 FAKE_SAMPLE_RATE = 16000
