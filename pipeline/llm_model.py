@@ -2,7 +2,7 @@ from time import time
 import subprocess, shlex, re, os
 from pathlib import Path
 
-from pipeline.Resource_Sampler import ResourceSampler
+from Resource_Sampler import ResourceSampler
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Any, Optional, List, Dict
 
