@@ -24,9 +24,6 @@ class StreamingRecorder:
     def start(self) -> None:
         """Start capturing microphone audio in a background thread."""
 
-        if sd is None:
-            raise RuntimeError("sounddevice is required for microphone recording")
-
         if self.recording:
             return
         self.recording = True
@@ -62,4 +59,5 @@ class StreamingRecorder:
         self.recording = False
         if self._thread:
             self._thread.join(timeout=1.0)
-        self._thread = None
+            self._thread = None
+

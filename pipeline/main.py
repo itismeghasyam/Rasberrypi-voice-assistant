@@ -9,11 +9,10 @@ from orchestrator import ParallelVoiceAssistant
 
 
 
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
 
-    parser.add_argument("--duration", type=float, default=6.0, help="How long to run the streaming demo")
+    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
     parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
@@ -69,19 +68,12 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--enable-stt-partials",
-        dest="enable_stt_partials",
         action="store_true",
-        default=True,
         help="Run whisper.cpp on each chunk for incremental transcripts",
-    )
-    parser.add_argument(
-        "--disable-stt-partials",
-        dest="enable_stt_partials",
-        action="store_false",
-        help="Disable per-chunk whisper.cpp processing until recording stops",
     )
 
     return parser.parse_args()
+
 
 def main() -> None:
     args = _parse_args()

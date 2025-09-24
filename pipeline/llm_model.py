@@ -240,10 +240,6 @@ class StreamingLLM:
             "timeout_seconds": self.llama_kwargs.get("timeout_seconds", 240),
         }
 
-        if llama110 is None:
-            print("[LLM] llama110 is not available")
-            return "I could not load the local LLM."
-
         try:
             result = llama110(prompt_text=prompt, **call_kwargs)
         except FileNotFoundError as exc:
@@ -263,7 +259,7 @@ class StreamingLLM:
     @staticmethod
     def _clean_response(response: str) -> str:
         text = (response or "").strip()
-        leading_quotes = ('"', "'", "`", "“", "”", "‘", "’")
+        leading_quotes = ('"', "'", "`", "â€œ", "â€", "â€˜", "â€™")
         while text and text[0] in leading_quotes:
             text = text[1:].lstrip()
         if text.startswith("?"):
@@ -278,3 +274,4 @@ class StreamingLLM:
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)
+

@@ -1,19 +1,382 @@
+
+from __future__ import annotations
+import re
+import argparse
+
+import contextlib
+import json
+import math
+import os
+import queue
+import shutil
+import subprocess
+
+import tempfile
+import threading
+import time
+import wave
+
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Any, Iterable, Dict, List, Deque, Tuple, Set
-from collections import deque
-from concurrent.futures import Future
-import time 
-
-import os, threading, queue, re, math, psutil, numpy as np 
-
-from config import CHUNK_DURATION, SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPER_MODEL_PATH, DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_TIMEOUT
-from recorder import StreamingRecorder
-from stt import ParallelSTT
-from tts import BufferedTTS
-from llm_model import StreamingLLM
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 
+import numpy as np
+import psutil
+import sounddevice as sd
+from concurrent.futures import Future, ThreadPoolExecutor
+
+
+from voice_test import llama110
+
+# ================================================================
+# Configuration
+# ================================================================
+PROJECT_DIR = Path.cwd()
+RECORDED_WAV = PROJECT_DIR / "recorded.wav"
+SAMPLE_RATE = 16000
+
+CHUNK_DURATION = 2.0  # seconds
+
+DEFAULT_SILENCE_TIMEOUT = 10.0  # seconds of inactivity before auto-stopping
+DEFAULT_SILENCE_THRESHOLD = 700.0  # RMS amplitude threshold for silence detection
+
+WHISPER_EXE = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
+WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
+
+
+PIPER_MODEL_PATH = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
+
+# ================================================================
+# Streaming Audio Recorder
+# ================================================================
+
+
+class StreamingRecorder:
+    """Capture microphone input continuously and expose fixed-size chunks."""
+
+    def __init__(self, chunk_duration: float = CHUNK_DURATION, sample_rate: int = SAMPLE_RATE):
+        self.chunk_duration = float(chunk_duration)
+        self.sample_rate = int(sample_rate)
+        self.chunk_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+        self.recording = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Start capturing microphone audio in a background thread."""
+
+        if self.recording:
+            return
+        self.recording = True
+        self._thread = threading.Thread(target=self._record_loop, name="StreamingRecorder", daemon=True)
+        self._thread.start()
+
+    def _record_loop(self) -> None:
+        chunk_samples = int(self.chunk_duration * self.sample_rate)
+        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="int16") as stream:
+            while self.recording:
+                audio_chunk, _ = stream.read(chunk_samples)
+                # Copy to detach from PortAudio's buffers
+                self.chunk_queue.put(audio_chunk.copy())
+
+    def get_chunk(self, timeout: float = 0.5) -> Optional[np.ndarray]:
+        try:
+            return self.chunk_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def clear_queue(self) -> None:
+        """Remove any queued audio chunks without blocking."""
+
+        try:
+            while True:
+                self.chunk_queue.get_nowait()
+        except queue.Empty:
+            return
+
+    def stop(self) -> None:
+        """Signal the recorder to stop and wait for the background thread."""
+
+        self.recording = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
+# ================================================================
+# Parallel Speech-to-Text (whisper.cpp)
+
+# ================================================================
+
+
+class ParallelSTT:
+
+    """Process audio chunks asynchronously using the whisper.cpp CLI."""
+
+    def __init__(
+        self,
+        num_workers: int = 2,
+
+        sample_rate: int = SAMPLE_RATE,
+        whisper_exe: Path = WHISPER_EXE,
+        whisper_model: Path = WHISPER_MODEL,
+        whisper_threads: Optional[int] = None,
+        emit_partials: bool = False,
+    ) -> None:
+        self.executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
+        self.sample_rate = int(sample_rate)
+        self.whisper_exe = Path(whisper_exe)
+        self.whisper_model = Path(whisper_model)
+        self.whisper_threads = int(whisper_threads) if whisper_threads else None
+        self.emit_partials = bool(emit_partials)
+
+        self._chunks: List[bytes] = []
+        self._transcript_lock = threading.Lock()
+        self._emitted_transcript = ""
+        self._last_partial = ""
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_stt_"))
+
+        if not self.whisper_exe.exists():
+            raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
+        if not self.whisper_model.exists():
+            raise FileNotFoundError(f"Whisper model not found: {self.whisper_model}")
+
+    # --------------------- Whisper helpers -----------------------
+
+    def _write_wav(self, audio_bytes: bytes, prefix: str) -> Path:
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", prefix=f"{prefix}_", dir=self._temp_dir, delete=False
+        )
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        with wave.open(str(tmp_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(audio_bytes)
+        return tmp_path
+
+    def _run_whisper(self, wav_path: Path, timeout: int = 60) -> str:
+        cmd = [
+            str(self.whisper_exe),
+            "-m",
+            str(self.whisper_model),
+            "-f",
+            str(wav_path),
+            "--no-prints",
+            "--output-txt",
+        ]
+        if self.whisper_threads:
+            cmd += ["-t", str(self.whisper_threads)]
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print("[STT][Whisper] Transcription timed out")
+            return ""
+        except Exception as exc:
+            print(f"[STT][Whisper] Error running whisper.cpp: {exc}")
+            return ""
+
+        text = ""
+        candidates = [wav_path.with_suffix(".txt"), Path(str(wav_path) + ".txt")]
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception as exc:
+                print(f"[STT][Whisper] Failed reading {candidate.name}: {exc}")
+                text = ""
+            finally:
+                candidate.unlink(missing_ok=True)
+            if text:
+                break
+
+        return text
+
+    def _process_chunk_whisper(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
+        wav_path = self._write_wav(audio_bytes, f"chunk{chunk_id}")
+        try:
+            text = self._run_whisper(wav_path, timeout=45)
+        finally:
+            wav_path.unlink(missing_ok=True)
+
+        text = (text or "").strip()
+        if not text:
+            return {"chunk_id": chunk_id, "text": "", "is_final": False}
+
+        with self._transcript_lock:
+            if text.lower() == self._last_partial.lower():
+                return {"chunk_id": chunk_id, "text": "", "is_final": False}
+            self._last_partial = text
+            self._emitted_transcript = (f"{self._emitted_transcript} {text}").strip()
+
+        return {"chunk_id": chunk_id, "text": text, "is_final": False}
+
+    def _finalize_whisper(self, chunk_id: int, mark_final: bool) -> Dict[str, Any]:
+        with self._transcript_lock:
+            chunks = list(self._chunks)
+            emitted = self._emitted_transcript.strip()
+            self._last_partial = ""
+            self._chunks.clear()
+
+        if not chunks:
+            return {"chunk_id": chunk_id, "text": "", "is_final": True}
+
+        wav_path = self._write_wav(b"".join(chunks), f"session{chunk_id}")
+        try:
+            full_text = (self._run_whisper(wav_path, timeout=120) or "").strip()
+        finally:
+            wav_path.unlink(missing_ok=True)
+
+        new_text = full_text
+        if emitted and full_text.lower().startswith(emitted.lower()):
+            new_text = full_text[len(emitted) :].strip()
+
+        with self._transcript_lock:
+            self._emitted_transcript = full_text
+
+        return {"chunk_id": chunk_id, "text": new_text, "is_final": mark_final}
+
+    def _empty_chunk(self, chunk_id: int) -> Dict[str, Any]:
+        return {"chunk_id": chunk_id, "text": "", "is_final": False}
+
+
+    # -------------------------- Public API -----------------------
+
+    def submit_chunk(self, audio_chunk: np.ndarray, chunk_id: int) -> Future:
+
+        audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
+        with self._transcript_lock:
+            self._chunks.append(audio_bytes)
+
+        if not self.emit_partials:
+            return self.executor.submit(self._empty_chunk, chunk_id)
+        return self.executor.submit(self._process_chunk_whisper, audio_bytes, chunk_id)
+
+    def finalize(self, chunk_id: int, mark_final: bool = True) -> Optional[Future]:
+        return self.executor.submit(self._finalize_whisper, chunk_id, mark_final)
+
+    def reset(self) -> None:
+        with self._transcript_lock:
+            self._chunks.clear()
+            self._emitted_transcript = ""
+            self._last_partial = ""
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=False)
+        with contextlib.suppress(Exception):
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+
+# ================================================================
+# Streaming LLM via llama110
+# ================================================================
+
+
+class StreamingLLM:
+    """Accumulate recognized text and asynchronously invoke llama110 when ready."""
+
+    def __init__(self, llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        self.context_buffer: List[str] = []
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.llama_kwargs = llama_kwargs or {}
+
+        self.llama_kwargs.setdefault("n_predict", 12)
+        self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
+        self.llama_kwargs.setdefault("temperature", 0.6)
+
+    def process_incremental(self, text_chunk: str, is_final: bool = False) -> Optional[Future]:
+        chunk = (text_chunk or "").strip()
+        if chunk:
+            self.context_buffer.append(chunk)
+
+        if not self.context_buffer and not chunk and not is_final:
+            return None
+
+        should_generate = False
+        if is_final:
+            should_generate = bool(self.context_buffer)
+        elif self._should_respond():
+            should_generate = True
+
+        if not should_generate:
+            return None
+
+        prompt_text = " ".join(self.context_buffer).strip()
+        self.context_buffer.clear()
+        if not prompt_text:
+            return None
+
+        return self.executor.submit(self._generate_response, prompt_text)
+
+    def _should_respond(self) -> bool:
+        current = " ".join(self.context_buffer)
+        return any(marker in current for marker in [".", "?", "!"])
+
+    def _generate_response(self, text: str) -> str:
+        prompt = f"Answer concisely: {text}".strip()
+        call_kwargs = {
+            "llama_cli_path": self.llama_kwargs.get("llama_cli_path"),
+            "model_path": self.llama_kwargs.get("model_path"),
+
+            "n_predict": self.llama_kwargs.get("n_predict", 12),
+            "threads": self.llama_kwargs.get("threads", os.cpu_count() or 4),
+            "temperature": self.llama_kwargs.get("temperature", 0.6),
+
+            "sampler": self.llama_kwargs.get("sampler"),
+            "tts_after": False,
+            "tts_cmd": None,
+            "timeout_seconds": self.llama_kwargs.get("timeout_seconds", 240),
+        }
+
+        try:
+            result = llama110(prompt_text=prompt, **call_kwargs)
+        except FileNotFoundError as exc:
+            print(f"[LLM] {exc}")
+            return "I could not load the local LLM."
+        except Exception as exc:
+            print(f"[LLM] Error invoking llama110: {exc}")
+            return "I encountered an error while thinking about that."
+
+        response = (result or {}).get("generated", "")
+        if not response:
+            fallback = (result or {}).get("raw_stdout") or ""
+            response = fallback.strip()
+
+        return self._clean_response(response)
+
+    @staticmethod
+    def _clean_response(response: str) -> str:
+        text = (response or "").strip()
+        leading_quotes = ('"', "'", "`", "â€œ", "â€", "â€˜", "â€™")
+        while text and text[0] in leading_quotes:
+            text = text[1:].lstrip()
+        if text.startswith("?"):
+            # Strip leading question mark artifacts such as ?" or ? 'Hello'
+            trimmed = text[1:].lstrip()
+            if trimmed and trimmed[0].isalpha():
+                text = trimmed
+        if text.startswith("\"") and len(text) > 1:
+            text = text[1:].lstrip()
+        return text
+
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=False)
+
+
+# ================================================================
+# Piper-based TTS with playback buffering
+# ================================================================
+
+
+
+# ================================================================
+# Parallel Voice Assistant Orchestrator
+# ================================================================
 
 
 @dataclass
@@ -743,3 +1106,219 @@ class ParallelVoiceAssistant:
                 break
 
             time.sleep(0.05)
+
+
+# ================================================================
+# Model Warm-up Helpers
+# ================================================================
+
+
+class ModelPreloader:
+    """Utility helpers to warm up the local models so first inference is faster."""
+
+    @staticmethod
+
+    def warmup_whisper(
+        whisper_exe: Path = WHISPER_EXE,
+        whisper_model: Path = WHISPER_MODEL,
+        sample_rate: int = SAMPLE_RATE,
+    ) -> None:
+        print("[WARMUP] Priming whisper.cpp...")
+        exe = Path(whisper_exe)
+        model = Path(whisper_model)
+        if not exe.exists():
+            print(f"[WARMUP] Whisper binary missing at {exe}")
+            return
+        if not model.exists():
+            print(f"[WARMUP] Whisper model missing at {model}")
+            return
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="whisper_warmup_"))
+        wav_path = tmp_dir / "warmup.wav"
+        success = True
+        try:
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(b"\x00" * sample_rate)
+            cmd = [
+                str(exe),
+                "-m",
+                str(model),
+                "-f",
+                str(wav_path),
+                "--no-prints",
+                "--output-txt",
+                "-t",
+                "1",
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=30)
+        except Exception as exc:
+            print(f"[WARMUP] Whisper warm-up failed: {exc}")
+            success = False
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if success:
+            print("[WARMUP] whisper.cpp ready")
+
+
+    @staticmethod
+    def warmup_llama(llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        print("[WARMUP] Warming up llama110...")
+        kwargs = llama_kwargs or {}
+        try:
+            llama110(
+                prompt_text="Hello",
+                llama_cli_path=kwargs.get("llama_cli_path"),
+                model_path=kwargs.get("model_path"),
+                n_predict=8,
+                threads=kwargs.get("threads", os.cpu_count() or 4),
+                temperature=kwargs.get("temperature", 0.5),
+                sampler=kwargs.get("sampler"),
+                timeout_seconds=kwargs.get("timeout_seconds", 120),
+            )
+        except Exception as exc:
+            print(f"[WARMUP] llama110 warm-up failed: {exc}")
+        else:
+            print("[WARMUP] llama110 ready")
+
+    @staticmethod
+    def warmup_piper(model_path: Path = PIPER_MODEL_PATH) -> None:
+        print("[WARMUP] Warming up Piper...")
+        model_path = Path(model_path)
+        if not model_path.exists():
+            print(f"[WARMUP] Piper model missing at {model_path}")
+            return
+        cmd = ["piper", "-m", str(model_path), "--output_file", "/tmp/piper_warmup.wav"]
+        try:
+            subprocess.run(cmd, input="Warm up".encode("utf-8"), check=True, timeout=10)
+        except Exception as exc:
+            print(f"[WARMUP] Piper warm-up failed: {exc}")
+        else:
+            Path("/tmp/piper_warmup.wav").unlink(missing_ok=True)
+            print("[WARMUP] Piper ready")
+
+
+# ================================================================
+# CLI entry point
+# ================================================================
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
+
+    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
+    parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
+    parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
+    parser.add_argument(
+        "--whisper-cli",
+        type=Path,
+        default=WHISPER_EXE,
+        help="Path to whisper.cpp CLI binary",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        type=Path,
+        default=WHISPER_MODEL,
+        help="Path to whisper.cpp model",
+    )
+    parser.add_argument(
+        "--whisper-threads",
+        type=int,
+        default=os.cpu_count() or 2,
+        help="Threads to dedicate to whisper.cpp",
+    )
+    parser.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="Threads to pass to llama110")
+    parser.add_argument("--n-predict", type=int, default=12, help="Tokens to generate with llama110")
+    parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature for llama110")
+    parser.add_argument("--llama-cli", type=Path, default=None, help="Optional override for llama-cli path")
+    parser.add_argument("--llama-model", type=Path, default=None, help="Optional override for llama model path")
+
+    parser.add_argument("--output-device", type=str, default=None, help="sounddevice output (index or name) for Piper playback")
+    parser.add_argument("--playback-cmd", nargs="+", default=None, help="Fallback playback command for Piper audio")
+    parser.add_argument(
+        "--force-subprocess-playback",
+        action="store_true",
+
+        help="Always use the playback command for Piper audio (default)",
+    )
+    parser.add_argument(
+        "--direct-playback",
+        action="store_true",
+        help="Play Piper audio through sounddevice instead of piping to the CLI player",
+    )
+
+    parser.add_argument(
+        "--silence-timeout",
+        type=float,
+        default=DEFAULT_SILENCE_TIMEOUT,
+        help="Seconds of silence before automatically stopping the recorder",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=DEFAULT_SILENCE_THRESHOLD,
+        help="RMS amplitude threshold (int16) to treat chunks as silence",
+    )
+
+    parser.add_argument(
+        "--enable-stt-partials",
+        action="store_true",
+        help="Run whisper.cpp on each chunk for incremental transcripts",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    llama_kwargs = {
+        "threads": args.threads,
+        "n_predict": args.n_predict,
+        "temperature": args.temperature,
+    }
+    if args.llama_cli:
+        llama_kwargs["llama_cli_path"] = str(args.llama_cli)
+    if args.llama_model:
+        llama_kwargs["model_path"] = str(args.llama_model)
+
+
+    if args.warmup:
+        ModelPreloader.warmup_whisper(args.whisper_cli, args.whisper_model)
+        ModelPreloader.warmup_llama(llama_kwargs)
+        ModelPreloader.warmup_piper(args.piper_model)
+
+    use_subprocess_playback = True
+    if args.direct_playback:
+        use_subprocess_playback = False
+    elif args.force_subprocess_playback:
+        use_subprocess_playback = True
+
+
+    assistant = ParallelVoiceAssistant(
+        chunk_duration=CHUNK_DURATION,
+        sample_rate=SAMPLE_RATE,
+        stt_workers=2,
+
+        whisper_exe=args.whisper_cli,
+        whisper_model=args.whisper_model,
+        whisper_threads=args.whisper_threads,
+        emit_stt_partials=args.enable_stt_partials,
+        piper_model_path=args.piper_model,
+        llama_kwargs=llama_kwargs,
+
+        output_device=args.output_device,
+        playback_cmd=args.playback_cmd,
+        use_subprocess_playback=use_subprocess_playback,
+
+        silence_timeout=args.silence_timeout,
+        silence_threshold=args.silence_threshold,
+    )
+    max_duration = args.duration if args.duration and args.duration > 0 else None
+    assistant.run(duration=max_duration)
+
+
+
+if __name__ == "__main__":
+    main()

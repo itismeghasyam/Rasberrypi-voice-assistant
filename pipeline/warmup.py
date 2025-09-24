@@ -41,10 +41,12 @@ class ModelPreloader:
                 str(exe),
                 "-m",
                 str(model),
-                "-f",str(wav_path),
+                "-f",
+                str(wav_path),
                 "--no-prints",
                 "--output-txt",
-                "-t","4",
+                "-t",
+                "1",
             ]
             subprocess.run(cmd, capture_output=True, timeout=30)
         except Exception as exc:
@@ -58,10 +60,6 @@ class ModelPreloader:
 
     @staticmethod
     def warmup_llama(llama_kwargs: Optional[Dict[str, Any]] = None) -> None:
-        if llama110 is None:
-            print("[WARMUP] llama110 unavailable; skipping warm-up")
-            return
-
         print("[WARMUP] Warming up llama110...")
         kwargs = llama_kwargs or {}
         try:
@@ -89,7 +87,7 @@ class ModelPreloader:
             return
         cmd = ["piper", "-m", str(model_path), "--output_file", "/tmp/piper_warmup.wav"]
         try:
-            subprocess.run(cmd, input="Warm up".encode("utf-8"), check=True, timeout=4)
+            subprocess.run(cmd, input="Warm up".encode("utf-8"), check=True, timeout=10)
         except Exception as exc:
             print(f"[WARMUP] Piper warm-up failed: {exc}")
         else:
