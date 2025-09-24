@@ -1,12 +1,10 @@
-import threading 
+import threading,queue
 from typing import Optional
-import numpy as np 
+import numpy as np, sounddevice as sd 
 
 from config import CHUNK_DURATION,SAMPLE_RATE
 
-import sounddevice as sd 
 
-import queue
 
 
 

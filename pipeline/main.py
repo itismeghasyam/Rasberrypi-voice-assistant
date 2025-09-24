@@ -1,12 +1,6 @@
 
-
 from pathlib import Path
-
-from collections import deque
-from concurrent.futures import Future
-
 import os, argparse
-
 
 from config import CHUNK_DURATION, SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPER_MODEL_PATH, DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_TIMEOUT
 from warmup import ModelPreloader
