@@ -5,7 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import os, subprocess, threading, queue, json, selectors,wave,tempfile
 import numpy as np, sounddevice as sd 
-from time import time
+import time
 
 from config import PIPER_MODEL_PATH
 

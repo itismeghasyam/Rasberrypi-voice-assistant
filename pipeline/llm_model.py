@@ -1,4 +1,4 @@
-from time import time
+import time
 import subprocess, shlex, re, os
 from pathlib import Path
 
