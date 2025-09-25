@@ -3,7 +3,9 @@ import shutil, threading, numpy as np
 import tempfile,subprocess,wave, contextlib
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
-import io, json, requests
+import io, json, requests,time
+
+
 from config import SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL
 
 
@@ -197,6 +199,8 @@ class ParallelSTTHTTP:
         self._last_partial = ""
         self._rolling: bytearray = bytearray()
         self._rolling_ms = 1200  # keep ~1.2 s of audio
+        self._last_http_fail = 0.0
+
 
         # quick health check (non-fatal)
         try:
@@ -235,9 +239,11 @@ class ParallelSTTHTTP:
             return text
         except requests.Timeout:
             print("Timeout HTTP")
+            self._last_http_fail = time.time()
             return ""
         except Exception as e:
             print(f"HTTP Error {e}")
+            self._last_http_fail = time.time()
             return ""
 
     def _process_chunk_http(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
@@ -252,12 +258,12 @@ class ParallelSTTHTTP:
             rolling = rolling + b"\x00" * (min_bytes - len(rolling))
 
         wav = self._wav_bytes(rolling)
-        text = (self._post_audio(wav, timeout=3.0) or "").strip()  # keep tight timeout
+        text = (self._post_audio(wav, timeout=5.0) or "").strip()  # keep tight timeout
 
         if not text:
             # optional fallback: try just the chunk once (rarely needed)
             wav_single = self._wav_bytes(audio_bytes)
-            text = (self._post_audio(wav_single, timeout=2.0) or "").strip()
+            text = (self._post_audio(wav_single, timeout=4.0) or "").strip()
 
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
 
@@ -300,6 +306,11 @@ class ParallelSTTHTTP:
 
             if not self.emit_partials:
                 return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
+            
+            # back off for 2s if server is timing out/absent
+            if (time.time() - getattr(self, "_last_http_fail", 0.0)) < 2.0:
+                return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
+
 
             return self.executor.submit(self._process_chunk_http, audio_bytes, chunk_id)
 
