@@ -273,7 +273,8 @@ class BufferedTTS:
             return None
 
         info = self._voice_info
-        cmd = ["piper", "-m", str(self.model_path), "--output-raw"]
+        cmd = ["/usr/local/bin/piper", "-m", str(self.model_path), "--output-raw"]
+
         # Piper streams raw 16-bit PCM on stdout when --output-raw is used. We don't
         # override the model's configured sample rate via CLI flags because some
         # Piper builds don't accept those options and may echo them as text. The
