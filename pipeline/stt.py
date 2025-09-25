@@ -213,7 +213,11 @@ class ParallelSTTHTTP:
         files = {"file": ("chunk.wav", wav_bytes, "audio/wav")}   # <— changed key to "file"
         data = {"response_format": "json"}  
         try:
-            r = requests.post(f"{self.server_url}/inference", files=files, timeout=timeout)
+            r = requests.post(f"{self.server_url}/inference",
+                  files=files,
+                  data={"response_format": "json"},   # <-- add this
+                  timeout=timeout)
+
             r.raise_for_status()
             data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
             # try common keys
