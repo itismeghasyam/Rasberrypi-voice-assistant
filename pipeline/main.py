@@ -72,6 +72,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run whisper.cpp on each chunk for incremental transcripts",
     )
+    
+    parser.add_argument("--whisper-server", type=str, default=None, help="URL of whisper.cpp server, e.g. http://127.0.0.1:8080")
 
     return parser.parse_args()
 
@@ -118,6 +120,7 @@ def main() -> None:
         use_subprocess_playback=use_subprocess_playback,
 
         silence_timeout=args.silence_timeout,
+        whisper_server=args.whisper_server,
         silence_threshold=args.silence_threshold,
     )
     max_duration = args.duration if args.duration and args.duration > 0 else None

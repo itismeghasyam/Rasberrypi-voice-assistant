@@ -66,20 +66,31 @@ class ParallelVoiceAssistant:
         use_subprocess_playback: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        whisper_server: Optional[str] = None,
         
         
 
     ) -> None:
         self._chunk_duration = float(chunk_duration)
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
-        self.stt = ParallelSTT(
-            num_workers=stt_workers,
-            sample_rate=sample_rate,
-            whisper_exe=whisper_exe,
-            whisper_model=whisper_model,
-            whisper_threads=whisper_threads,
-            emit_partials=emit_stt_partials,
-        )
+        if whisper_server:
+            # HTTP (persistent) STT
+            from stt import ParallelSTTHTTP
+            self.stt = ParallelSTTHTTP(
+                num_workers=stt_workers,
+                sample_rate=sample_rate,
+                server_url=whisper_server,
+                emit_partials=True,
+            )
+        else:
+            self.stt = ParallelSTT(
+                num_workers=stt_workers,
+                sample_rate=sample_rate,
+                whisper_exe=whisper_exe,
+                whisper_model=whisper_model,
+                whisper_threads=whisper_threads,
+                emit_partials=emit_stt_partials,
+            )
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
 
         self.tts = BufferedTTS(
@@ -137,7 +148,7 @@ class ParallelVoiceAssistant:
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
         self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(4.0 / max(0.1, self._chunk_duration))))
-        self._awaiting_transcript_timeout = max(3.0, self._chunk_duration * 2.5)
+        self._awaiting_transcript_timeout = max(1.0, self._chunk_duration * 1.5)
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
         self._active_flush_ids: Set[int] = set()

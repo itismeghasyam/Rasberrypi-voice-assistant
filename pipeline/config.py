@@ -14,3 +14,4 @@ WHISPER_MODEL = Path.home() / "whisper.cpp" / "models" / "ggml-tiny.bin"
 
 
 PIPER_MODEL_PATH = Path.home() / "Rasberrypi-voice-assistant" / "voices" / "en_US-amy-medium.onnx"
+WHISPER_SERVER_URL = "http://127.0.0.1:8080"
