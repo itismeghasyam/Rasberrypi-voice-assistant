@@ -338,12 +338,21 @@ class ParallelVoiceAssistant:
 
         stt_thread.join(timeout=5.0)
 
-        finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
+        # Decide whether to run a final STT pass
+        finalize_future = None
+        if self.stats.stt_chunks > 0:
+            recent_voice = False
+            with self._activity_lock:
+                if self._last_voice_time:
+                    recent_voice = (time.time() - self._last_voice_time) < 1.0
+
+        if not recent_voice:
+            finalize_future = self.stt.finalize(self.stats.stt_chunks + 1)
+
         if finalize_future is not None:
-
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
+            self._drain_futures()
 
-            self._process_stt_results(wait=True)
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
         self._stt_done.set()

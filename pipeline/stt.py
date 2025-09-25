@@ -195,6 +195,8 @@ class ParallelSTTHTTP:
         self._transcript_lock = threading.Lock()
         self._emitted_transcript = ""
         self._last_partial = ""
+        self._rolling: bytearray = bytearray()
+        self._rolling_ms = 1200  # keep ~1.2 s of audio
 
         # quick health check (non-fatal)
         try:
@@ -235,19 +237,26 @@ class ParallelSTTHTTP:
             return ""
 
     def _process_chunk_http(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
-        wav = self._wav_bytes(audio_bytes)
-        text = (self._post_audio(wav, timeout=5.0) or "").strip()
+        # --- build a WAV from the rolling tail (~1.2 s), not just this chunk
+        with self._transcript_lock:
+            rolling = bytes(self._rolling)
+
+        # safety: if rolling is very short/silent, pad to ~200 ms
+        min_ms = 200.0
+        min_bytes = int(self.sample_rate * 2 * (min_ms / 1000.0))
+        if len(rolling) < min_bytes:
+            rolling = rolling + b"\x00" * (min_bytes - len(rolling))
+
+        wav = self._wav_bytes(rolling)
+        text = (self._post_audio(wav, timeout=3.0) or "").strip()  # keep tight timeout
 
         if not text:
-            return {"chunk_id": chunk_id, "text": "", "is_final": False}
-
-        with self._transcript_lock:
-            if text.lower() == self._last_partial.lower():
-                return {"chunk_id": chunk_id, "text": "", "is_final": False}
-            self._last_partial = text
-            self._emitted_transcript = (f"{self._emitted_transcript} {text}").strip()
+            # optional fallback: try just the chunk once (rarely needed)
+            wav_single = self._wav_bytes(audio_bytes)
+            text = (self._post_audio(wav_single, timeout=2.0) or "").strip()
 
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
+
 
     def _finalize_http(self, chunk_id: int, mark_final: bool) -> Dict[str, Any]:
         # Join buffered PCM and send once more for a full pass (to catch trailing words)
@@ -261,7 +270,7 @@ class ParallelSTTHTTP:
             return {"chunk_id": chunk_id, "text": "", "is_final": True}
 
         wav = self._wav_bytes(b"".join(chunks))
-        full_text = (self._post_audio(wav, timeout=12.0) or "").strip()
+        full_text = (self._post_audio(wav, timeout=6.0) or "").strip()
 
         new_text = full_text
         if emitted and full_text.lower().startswith(emitted.lower()):
@@ -277,11 +286,18 @@ class ParallelSTTHTTP:
         audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
         with self._transcript_lock:
             self._chunks.append(audio_bytes)
+            # update rolling buffer (PCM int16 mono)
+            max_bytes = int(self.sample_rate * 2 * (self._rolling_ms / 1000.0))
+            self._rolling.extend(audio_bytes)
+            if len(self._rolling) > max_bytes:
+                # keep tail only
+                self._rolling = self._rolling[-max_bytes:]
+              
 
-        if not self.emit_partials:
-            return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
+            if not self.emit_partials:
+                return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
 
-        return self.executor.submit(self._process_chunk_http, audio_bytes, chunk_id)
+            return self.executor.submit(self._process_chunk_http, audio_bytes, chunk_id)
 
     def finalize(self, chunk_id: int, mark_final: bool = True) -> Optional[Future]:
         return self.executor.submit(self._finalize_http, chunk_id, mark_final)
