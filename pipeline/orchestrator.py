@@ -113,7 +113,7 @@ class ParallelVoiceAssistant:
         self._stop_requested = False
         self._stop_reason: Optional[str] = None
         self._consecutive_silent_chunks = 0
-        self._silent_chunks_before_stop = 2
+        self._silent_chunks_before_stop = max(3,int(math.ceil(self._silence_timeout/max(0.1,self._chunk_duration))))
         
         self._noise_blacklist = {
             "wind blowing",
@@ -466,12 +466,12 @@ class ParallelVoiceAssistant:
                     self._awaiting_transcript_chunks += 1
                     if self._awaiting_transcript_started_at is None:
                         self._awaiting_transcript_started_at = time.time()
-                    if self._awaiting_transcript_chunks >= self._silent_chunks_before_stop:
+                    """if self._awaiting_transcript_chunks >= self._silent_chunks_before_stop:
                         # Ambient noise can keep RMS high while Whisper emits nothing; treat
                         # this as silence so we still stop after the configured no-speech chunks.
                         self._reset_awaiting_transcript_state()
                         self._handle_silent_audio_chunk()
-                        continue
+                        continue"""
                     if self._should_force_intermediate_transcription():
                         elapsed = 0.0
                         if self._awaiting_transcript_started_at is not None:
