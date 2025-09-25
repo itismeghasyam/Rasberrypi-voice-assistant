@@ -4,7 +4,7 @@ from typing import Optional, Any, Dict
 import os, tempfile, wave, subprocess, shutil
 
 from config import SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPER_MODEL_PATH, DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_TIMEOUT
-from llm_model import llama110
+
 
 
 
@@ -14,6 +14,7 @@ class ModelPreloader:
     @staticmethod
 
     def warmup_whisper(
+        
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
         sample_rate: int = SAMPLE_RATE,
@@ -63,6 +64,7 @@ class ModelPreloader:
         print("[WARMUP] Warming up llama110...")
         kwargs = llama_kwargs or {}
         try:
+            from llm_model import llama110
             llama110(
                 prompt_text="Hello",
                 llama_cli_path=kwargs.get("llama_cli_path"),
