@@ -4,7 +4,7 @@ PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
 SAMPLE_RATE = 16000
 
-CHUNK_DURATION = 0.5  
+CHUNK_DURATION = 2.0
 
 DEFAULT_SILENCE_TIMEOUT = 4.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 800.0  # RMS amplitude threshold for silence detection
