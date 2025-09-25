@@ -69,6 +69,9 @@ class BufferedTTS:
             self.output_device = output_device
         self.on_playback_start = on_playback_start
         self.on_playback_error = on_playback_error
+        
+        self._piper_proc = None
+        self._piper_lock = threading.Lock()
 
         self._playback_env = os.environ.copy()
         if isinstance(self.output_device, str):
@@ -123,6 +126,20 @@ class BufferedTTS:
             )
 
         return PiperVoiceInfo()
+    
+    def _ensure_piper(self):
+        if self._piper_proc and self._piper_proc.poll() is None:
+            return 
+        info = self._voice_info
+        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output-raw"]
+        if info.speaker_id is not None:
+            cmd += ["--speaker", str(info.speaker_id)]
+        
+        self._piper_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr= subprocess.DEVNULL,
+                                            bufsize = 0
+                                            )
 
 
     def start_playback(self) -> None:
@@ -271,73 +288,111 @@ class BufferedTTS:
         utterance = " ".join((text or "").split())
         if not utterance:
             return None
-
-        info = self._voice_info
-        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output-raw"]
-
-        # Piper streams raw 16-bit PCM on stdout when --output-raw is used. We don't
-        # override the model's configured sample rate via CLI flags because some
-        # Piper builds don't accept those options and may echo them as text. The
-        # returned PCM is still generated at the voice's native sample rate, which
-        # we honour when creating the temporary WAV container below.
-        if info.speaker_id is not None:
-            cmd += ["--speaker", str(info.speaker_id)]
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_path = Path(tmp_file.name)
-        keep_file = False
-        try:
-            input_bytes = (utterance + "\n").encode("utf-8")
-            proc = subprocess.run(
-                cmd,
-                input=input_bytes,
-                capture_output=True,
-                check=True,
-                timeout=self.timeout,
-            )
-            audio_bytes = proc.stdout
-            if self._looks_like_text(audio_bytes):
-                preview = audio_bytes[:120].decode("utf-8", errors="replace")
-                print(
-                    "[TTS] Piper returned textual output instead of audio; "
-                    f"got: {preview!r}"
-                )
-                return None
+        
+        with self._piper_lock:
+            self._ensure_piper()
+            proc = self._piper_proc
+            
+            if not proc or proc.poll() is not None:
+                print("[TTS] Piper proc is not running")
+                return None 
+            
+            try:
+                proc.stdin.write((utterance + "\n" ).encode("utf-8"))
+                proc.stdin.flush()
+            except Exception as e:
+                print(f"[TTS] failed writing to piper: {e}")
+                
+                self._restart_piper_and_retry(utterance)
+                proc = self._piper_proc
+                
+                if not proc or proc.poll() is not None:
+                    return None 
+                
+            audio_bytes = self._read_pcm_until_idle(proc.stdout, idle_ms=120,max_ms = self.timeout*1000)
             if not audio_bytes:
                 print("[TTS] Piper returned no audio data")
-                return None
-
-            with wave.open(str(tmp_path), "wb") as wf:
-                wf.setnchannels(info.channels or 1)
-                wf.setsampwidth(2)
-                wf.setframerate(info.sample_rate or 22050)
-                wf.writeframes(audio_bytes)
-            keep_file = True
-
-            sample_rate = info.sample_rate or 22050
-            segment = SpeechSegment(
-                path=str(tmp_path),
-                raw=audio_bytes,
-                sample_rate=sample_rate,
-                channels=info.channels or 1,
-                text=utterance,
-            )
-            self.speech_queue.put(segment)
-            return segment
-
-        except subprocess.CalledProcessError as exc:
-            print(f"[TTS] Piper returned error: {exc}")
-        except Exception as exc:
-            print(f"[TTS] Piper failed: {exc}")
+                return None 
+            
+            info = self._voice_info
+            with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                
+            keep_file = False
+            
+            try:
+                with wave.open(str(tmp_path), "wb") as wf:
+                    wf.setnchannels(info.channels or 1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(info.sample_rate or 22050)
+                    wf.writeframes(audio_bytes)
+                keep_file = True
+                
+                segment = SpeechSegment(
+                    path = str(tmp_path),
+                    raw = audio_bytes,
+                    sample_rate = info.sample_rate or 22050,
+                    channels = info.channels or 1,
+                    text = utterance,
+                    
+                )
+                
+                self.speech_queue.put(segment)
+                return segment 
+            finally: 
+                if not keep_file and tmp_path.exists():
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    
+    def _restart_piper_and_retry(self,utterance:str):
+        try:
+            if self._piper_proc:
+                self._piper_proc.kill()
+        except Exception:
+            pass
+        
+        self._piper_proc= None
+        self._ensure_piper()
+        if self._piper_proc and self._piper_proc.poll() is None:
+            try:
+                self._piper_proc.stdin.write((utterance + "\n").encode("utf-8"))
+                self._piper_proc.stdin.flush()
+            except Exception as e : 
+                print(f"[TTS] Piper failed to retry : {e} ")
+                
+    def _read_pcm_until_idle(self,stdout,idle_ms = 120,max_ms=30_000)->bytes:
+        start = last = time.time()
+        idle_s = idle_ms/1000.0
+        deadline = start + (max_ms/1000.0)
+        
+        chunks = []
+        
+        stdout_fd = stdout.fileno()
+        sel = selectors.DefaultSelector()
+        
+        sel.register(stdout_fd, selectors.EVENT_READ)
+        
+        try:
+            while time.time() < deadline:
+                events = sel.select(timeout=idle_s)
+                if not events:
+                    break
+                for _key,_mask in events :
+                    data = os.read(stdout_fd, 8192)
+                    if not data:
+                        return b"".join(chunks)
+                    
+                    chunks.append(data)
+                    last = time.time()
+            return b"".join(chunks)
         finally:
-
-            if not keep_file and tmp_path.exists():
-                try:
-                    tmp_path.unlink(missing_ok=True)
-
-                except OSError:
-                    pass
-        return None
+            try:
+                sel.unregister(stdout_fd)
+            except Exception:
+                pass
+        
 
     @staticmethod
     def _looks_like_text(payload: bytes) -> bool:
@@ -357,4 +412,11 @@ class BufferedTTS:
         if self._playback_thread:
             self._playback_thread.join(timeout=1.0)
             self._playback_thread = None
+        try:
+            with self._piper_lock:
+                if self._piper_proc and self._piper_proc.poll() is None :
+                    self._piper_proc.terminate()
+        except Exception:
+            pass
+        self._piper_proc = None
         self.executor.shutdown(wait=False)
