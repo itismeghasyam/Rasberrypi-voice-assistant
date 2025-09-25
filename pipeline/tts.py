@@ -72,6 +72,8 @@ class BufferedTTS:
         
         self._piper_proc = None
         self._piper_lock = threading.Lock()
+        
+        self.out_dir = None 
 
         self._playback_env = os.environ.copy()
         if isinstance(self.output_device, str):
@@ -130,8 +132,12 @@ class BufferedTTS:
     def _ensure_piper(self):
         if self._piper_proc and self._piper_proc.poll() is None:
             return 
+        
+        if self.out_dir is None :
+            self.out_dir = Path(tempfile.mkdtemp(prefix="piper_out_"))
+            
         info = self._voice_info
-        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output-raw"]
+        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output-dir"]
         if info.speaker_id is not None:
             cmd += ["--speaker", str(info.speaker_id)]
         
@@ -309,42 +315,24 @@ class BufferedTTS:
                 if not proc or proc.poll() is not None:
                     return None 
                 
-            audio_bytes = self._read_pcm_until_idle(proc.stdout, idle_ms=120,max_ms = self.timeout*1000)
-            if not audio_bytes:
-                print("[TTS] Piper returned no audio data")
-                return None 
-            
+            wav_path = (proc.stdout.readline() or "").strip()
+            if not wav_path :
+                print(f"piper did not return a path")
+                return None
+                
             info = self._voice_info
-            with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as tmp_file:
-                tmp_path = Path(tmp_file.name)
+            segment = SpeechSegment(
+                path = wav_path,
+                raw = b"",
+                sample_rate = info.sample_rate or 22050,
+                channels = info.channels or 1,
+                text = utterance,
                 
-            keep_file = False
+            )
             
-            try:
-                with wave.open(str(tmp_path), "wb") as wf:
-                    wf.setnchannels(info.channels or 1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(info.sample_rate or 22050)
-                    wf.writeframes(audio_bytes)
-                keep_file = True
-                
-                segment = SpeechSegment(
-                    path = str(tmp_path),
-                    raw = audio_bytes,
-                    sample_rate = info.sample_rate or 22050,
-                    channels = info.channels or 1,
-                    text = utterance,
-                    
-                )
-                
-                self.speech_queue.put(segment)
-                return segment 
-            finally: 
-                if not keep_file and tmp_path.exists():
-                    try:
-                        tmp_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            self.speech_queue.put(segment)
+            return segment 
+            
     
     def _restart_piper_and_retry(self,utterance:str):
         try:
@@ -420,3 +408,4 @@ class BufferedTTS:
             pass
         self._piper_proc = None
         self.executor.shutdown(wait=False)
+    
