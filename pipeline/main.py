@@ -9,6 +9,7 @@ from orchestrator import ParallelVoiceAssistant
 
 
 
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
 
