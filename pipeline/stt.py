@@ -233,7 +233,11 @@ class ParallelSTTHTTP:
             if not text and isinstance(data.get("segments"), list):
                 text = " ".join(seg.get("text","") for seg in data["segments"]).strip()
             return text
-        except Exception:
+        except requests.Timeout:
+            print("Timeout HTTP")
+            return ""
+        except Exception as e:
+            print(f"HTTP Error {e}")
             return ""
 
     def _process_chunk_http(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
