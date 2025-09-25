@@ -403,13 +403,18 @@ class ParallelVoiceAssistant:
 
                 # Submit to STT as usual (we rely on _process_stt_results to treat
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
-                future = self.stt.submit_chunk(audio_chunk, chunk_id)
+                if not is_silent:
+                    self._register_activity()
+                future = (
+                    self.stt.empty_future(chunk_id)
+                    if is_silent
+                    else self.stt.submit_chunk(audio_chunk, chunk_id)
+                )
                 self.stt_futures.put((chunk_id, future, time.time()))
-
                 self.stats.stt_chunks += 1
                 chunk_id += 1
-
                 self._process_stt_results(wait=False)
+
 
             self._process_stt_results(wait=True)
         finally:

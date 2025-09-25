@@ -45,6 +45,9 @@ class ParallelSTT:
             raise FileNotFoundError(f"Whisper model not found: {self.whisper_model}")
 
     # --------------------- Whisper helpers -----------------------
+    
+    def empty_future(self, chunk_id: int) -> Future:
+        return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
 
     def _write_wav(self, audio_bytes: bytes, prefix: str) -> Path:
         tmp = tempfile.NamedTemporaryFile(
@@ -198,6 +201,9 @@ class ParallelSTTHTTP:
             requests.get(self.server_url, timeout=0.5)
         except Exception:
             pass
+        
+    def empty_future(self, chunk_id: int) -> Future:
+        return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
 
     def _wav_bytes(self, audio_bytes: bytes) -> bytes:
         bio = io.BytesIO()
