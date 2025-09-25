@@ -106,7 +106,7 @@ def main() -> None:
     assistant = ParallelVoiceAssistant(
         chunk_duration=CHUNK_DURATION,
         sample_rate=SAMPLE_RATE,
-        stt_workers=2,
+        stt_workers=1,
 
         whisper_exe=args.whisper_cli,
         whisper_model=args.whisper_model,
