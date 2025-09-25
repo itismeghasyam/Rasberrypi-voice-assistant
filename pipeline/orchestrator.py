@@ -351,7 +351,8 @@ class ParallelVoiceAssistant:
 
         if finalize_future is not None:
             self.stt_futures.put((self.stats.stt_chunks + 1, finalize_future, time.time()))
-            self._drain_futures()
+            # Drain STT futures (including this final one) before telling LLM no more text is coming
+            self._process_stt_results(wait=True)
 
 
         # Signal the LLM pipeline that no more text is coming once final STT results are queued.
