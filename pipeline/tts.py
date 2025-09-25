@@ -137,14 +137,15 @@ class BufferedTTS:
             self.out_dir = Path(tempfile.mkdtemp(prefix="piper_out_"))
             
         info = self._voice_info
-        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output-dir"]
+        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output_dir", str(self.out_dir)]
         if info.speaker_id is not None:
             cmd += ["--speaker", str(info.speaker_id)]
         
         self._piper_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE,
                                             stderr= subprocess.DEVNULL,
-                                            bufsize = 0
+                                            text=True,
+                                            bufsize = 1
                                             )
 
 
@@ -304,7 +305,7 @@ class BufferedTTS:
                 return None 
             
             try:
-                proc.stdin.write((utterance + "\n" ).encode("utf-8"))
+                proc.stdin.write((utterance + "\n" ))
                 proc.stdin.flush()
             except Exception as e:
                 print(f"[TTS] failed writing to piper: {e}")
@@ -314,12 +315,26 @@ class BufferedTTS:
                 
                 if not proc or proc.poll() is not None:
                     return None 
-                
-            wav_path = (proc.stdout.readline() or "").strip()
-            if not wav_path :
-                print(f"piper did not return a path")
+            
+            wav_raw = (proc.stdout.readline() or "").strip()
+            if not wav_raw:
+                print("Piper did not return a path")
                 return None
+            tokens = wav_raw.split()
+            
+            candidate = tokens[-1] if tokens else wav_raw
+            
+            p = Path(candidate)
+            
+            if not p.is_file() and self.out_dir:
+                p = Path(self.out_dir) / candidate
+            if not p.is_file():
+                print("[TTS]Piper returned an unreadable path")
+                return None 
+            
                 
+            wav_path = (str(p))
+        
             info = self._voice_info
             segment = SpeechSegment(
                 path = wav_path,
@@ -345,7 +360,7 @@ class BufferedTTS:
         self._ensure_piper()
         if self._piper_proc and self._piper_proc.poll() is None:
             try:
-                self._piper_proc.stdin.write((utterance + "\n").encode("utf-8"))
+                self._piper_proc.stdin.write((utterance + "\n"))
                 self._piper_proc.stdin.flush()
             except Exception as e : 
                 print(f"[TTS] Piper failed to retry : {e} ")
@@ -404,8 +419,19 @@ class BufferedTTS:
             with self._piper_lock:
                 if self._piper_proc and self._piper_proc.poll() is None :
                     self._piper_proc.terminate()
+                    try:
+                        self._piper_proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
         except Exception:
             pass
         self._piper_proc = None
+        
+        try:
+            if self.out_dir:
+                import shutil
+                shutil.rmtree(self.out_dir,ignore_errors=True)
+        finally:
+            self.out_dir = None
         self.executor.shutdown(wait=False)
     
