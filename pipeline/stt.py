@@ -263,7 +263,7 @@ class ParallelSTTHTTP:
         if not text:
             # optional fallback: try just the chunk once (rarely needed)
             wav_single = self._wav_bytes(audio_bytes)
-            text = (self._post_audio(wav_single, timeout=4.0) or "").strip()
+            text = (self._post_audio(wav_single, timeout=2.0) or "").strip()
 
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
 

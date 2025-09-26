@@ -2,9 +2,9 @@ from pathlib import Path
 
 PROJECT_DIR = Path.cwd()
 RECORDED_WAV = PROJECT_DIR / "recorded.wav"
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 8000
 
-CHUNK_DURATION =  0.5
+CHUNK_DURATION =  0.25
 
 DEFAULT_SILENCE_TIMEOUT = 2.0  # seconds of inactivity before auto-stopping
 DEFAULT_SILENCE_THRESHOLD = 1600.0  # RMS amplitude threshold for silence detection

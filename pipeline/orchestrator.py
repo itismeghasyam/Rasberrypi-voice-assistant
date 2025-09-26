@@ -147,7 +147,7 @@ class ParallelVoiceAssistant:
         self._chunk_activity: Dict[int, bool] = {}
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
-        self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(4.0 / max(0.1, self._chunk_duration))))
+        self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(2.0 / max(0.1, self._chunk_duration))))
         self._awaiting_transcript_timeout = max(1.0, self._chunk_duration * 1.5)
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
