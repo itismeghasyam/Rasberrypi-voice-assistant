@@ -748,13 +748,7 @@ class ParallelVoiceAssistant:
         else:
             print("Recording stop -> first TTS audio: n/a")
         
-        if self.stats.recording_start_to_first_tts_latency is not None:
-            print(
-                "Recording start -> first TTS audio: "
-                f"{self.stats.recording_start_to_first_tts_latency:.2f}s"
-            )
-        else:
-            print("Recording start -> first TTS audio: n/a")
+       
 
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
