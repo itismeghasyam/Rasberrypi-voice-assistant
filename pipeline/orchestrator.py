@@ -688,18 +688,22 @@ class ParallelVoiceAssistant:
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        sentences: List[str] = []
-        current: List[str] = []
-        for word in text.split():
-            current.append(word)
-            if any(word.endswith(p) for p in [".", "!", "?", ","]):
-                sentences.append(" ".join(current))
-                current = []
-        if current:
-            sentences.append(" ".join(current))
-        return sentences
-
-
+        words = text.split()
+        
+        out: List[str] = []
+        cur: List[str] = []
+        MAX_WORDS = 10
+        for w in words :
+            cur.append(w)
+            if len(cur) >= MAX_WORDS or any(w.endswith(p) for p in (".","!","?")):
+                out.append(" ".join(cur))
+                cur = []
+        
+        if cur:
+            out.append(" ".join(cur))
+            
+        return out
+        
     @staticmethod
     def _print_latency_summary(label: str, samples: List[float]) -> None:
         if not samples:

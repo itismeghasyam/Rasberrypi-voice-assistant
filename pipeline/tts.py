@@ -41,7 +41,8 @@ class BufferedTTS:
         use_subprocess: bool = False,
         on_playback_start: Optional[Callable[[str, float], None]] = None,
         on_playback_error: Optional[Callable[[], None]] = None,
-        timeout :int = 30
+        timeout :int = 30,
+        blocking_playback :bool = True
 
     ) -> None:
         self.model_path = Path(model_path)
@@ -54,8 +55,12 @@ class BufferedTTS:
         if playback_cmd:
             self.playback_cmd = list(playback_cmd)
         else:
-            self.playback_cmd = ["aplay", "{file}"]
+            info = self._voice_info
+            self.playback_cmd = ["aplay","-t","raw", "-f","S16_LE","-r",str(info.sample_rate),"-c",str(info.channels), "-"]
         self.use_subprocess = bool(use_subprocess)
+        self.blocking_playback = bool (blocking_playback)
+        
+        
         if output_device is None:
             self.output_device = None
         elif isinstance(output_device, int):
@@ -137,15 +142,15 @@ class BufferedTTS:
             self.out_dir = Path(tempfile.mkdtemp(prefix="piper_out_"))
             
         info = self._voice_info
-        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output_dir", str(self.out_dir)]
+        cmd = ["/usr/local/bin/piper/piper", "-m", str(self.model_path), "--output_raw", "-"]
         if info.speaker_id is not None:
             cmd += ["--speaker", str(info.speaker_id)]
         
         self._piper_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE,
                                             stderr= subprocess.DEVNULL,
-                                            text=True,
-                                            bufsize = 1
+                                            text=False,
+                                            bufsize = 0
                                             )
 
 
@@ -230,10 +235,11 @@ class BufferedTTS:
                     audio = audio.reshape(-1, channels)
 
             sd.stop()
-            sd.play(audio, sample_rate, device=self.output_device, blocking=False)
+            sd.play(audio, sample_rate, device=self.output_device, blocking=self.blocking_playback)
             if self.on_playback_start:
                 self.on_playback_start(segment.path, time.time())
-            sd.wait()
+            if self.blocking_playback:
+                sd.wait()
             return True
         except Exception as exc:
             print(f"[TTS] Direct playback failed for {segment.path}: {exc}")
@@ -305,7 +311,7 @@ class BufferedTTS:
                 return None 
             
             try:
-                proc.stdin.write((utterance + "\n" ))
+                proc.stdin.write((utterance + "\n" ).encode("utf-8"))
                 proc.stdin.flush()
             except Exception as e:
                 print(f"[TTS] failed writing to piper: {e}")
@@ -316,34 +322,22 @@ class BufferedTTS:
                 if not proc or proc.poll() is not None:
                     return None 
             
-            wav_raw = (proc.stdout.readline() or "").strip()
-            if not wav_raw:
-                print("Piper did not return a path")
-                return None
-            tokens = wav_raw.split()
-            
-            candidate = tokens[-1] if tokens else wav_raw
-            
-            p = Path(candidate)
-            
-            if not p.is_file() and self.out_dir:
-                p = Path(self.out_dir) / candidate
-            if not p.is_file():
-                print("[TTS]Piper returned an unreadable path")
+            payload = self._read_pcm_until_idle(proc.stdout, idle_ms=80)
+            if not payload or self._looks_like_text(payload):
+                print("[TTS] Piper did not produce PCM; check --output_raw '-'")
                 return None 
-            
-                
-            wav_path = (str(p))
         
             info = self._voice_info
             segment = SpeechSegment(
-                path = wav_path,
-                raw = b"",
+                path = "",
+                raw = payload,
                 sample_rate = info.sample_rate or 22050,
                 channels = info.channels or 1,
                 text = utterance,
                 
             )
+            
+            
             
             self.speech_queue.put(segment)
             return segment 
@@ -360,13 +354,13 @@ class BufferedTTS:
         self._ensure_piper()
         if self._piper_proc and self._piper_proc.poll() is None:
             try:
-                self._piper_proc.stdin.write((utterance + "\n"))
+                self._piper_proc.stdin.write((utterance + "\n").encode("utf-8"))
                 self._piper_proc.stdin.flush()
             except Exception as e : 
                 print(f"[TTS] Piper failed to retry : {e} ")
                 
     def _read_pcm_until_idle(self,stdout,idle_ms = 120,max_ms=30_000)->bytes:
-        start = last = time.time()
+        start = time.time()
         idle_s = idle_ms/1000.0
         deadline = start + (max_ms/1000.0)
         
@@ -385,14 +379,20 @@ class BufferedTTS:
                 for _key,_mask in events :
                     data = os.read(stdout_fd, 8192)
                     if not data:
-                        return b"".join(chunks)
+                        payload = b"".join(chunks)
+                        return payload if (len(payload) & 1) == 0 else payload[:-1]
                     
                     chunks.append(data)
-                    last = time.time()
-            return b"".join(chunks)
+            payload = b"".join(chunks)
+            return payload if (len(payload)&1) == 0 else payload[:-1]
         finally:
             try:
                 sel.unregister(stdout_fd)
+            except Exception:
+                pass
+            
+            try:
+                sel.close()
             except Exception:
                 pass
         
