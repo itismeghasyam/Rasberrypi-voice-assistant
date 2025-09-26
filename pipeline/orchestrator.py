@@ -32,7 +32,7 @@ class PipelineStats:
     tts_segments: int = 0
     total_latency: float = 0.0
     start_time: float = field(default_factory=time.time)
-
+    
     stt_latencies: List[float] = field(default_factory=list)
     llm_latencies: List[float] = field(default_factory=list)
     tts_generation_latencies: List[float] = field(default_factory=list)
@@ -42,7 +42,7 @@ class PipelineStats:
     recording_stop_time: Optional[float] = None
     recording_to_first_llm_latency: Optional[float] = None
     recording_stop_to_first_tts_latency: Optional[float] = None
-
+    recording_start_to_first_tts_latency: Optional[float] = None
 
 
 class ParallelVoiceAssistant:
@@ -259,7 +259,7 @@ class ParallelVoiceAssistant:
         self.stats.start_time = start_time
         self.stats.recording_stop_time = None
         self.stats.recording_to_first_llm_latency = None
-
+        self.stats.recording_start_time = start_time
         self.stats.recording_stop_to_first_tts_latency = None
 
         self._stt_done.clear()
@@ -643,6 +643,14 @@ class ParallelVoiceAssistant:
                     pass
 
     def _on_tts_playback_start(self, file_path: str, started_at: float) -> None:
+        
+        if (
+        self.stats.recording_start_to_first_tts_latency is None
+        and getattr(self.stats, "recording_start_time", None) is not None
+        ):
+            self.stats.recording_start_to_first_tts_latency = max(
+                0.0, started_at - self.stats.recording_start_time
+            )
 
         if (
             self.stats.recording_stop_to_first_tts_latency is None
@@ -744,6 +752,15 @@ class ParallelVoiceAssistant:
             )
         else:
             print("Recording stop -> first TTS audio: n/a")
+        
+        if self.stats.recording_start_to_first_tts_latency is not None:
+            print(
+                "Recording start -> first TTS audio: "
+                f"{self.stats.recording_start_to_first_tts_latency:.2f}s"
+            )
+        else:
+            print("Recording start -> first TTS audio: n/a")
+
         self._print_latency_summary("TTS generation latency", list(self.stats.tts_generation_latencies))
         self._print_latency_summary("Input -> first audio gap", list(self.stats.input_to_output_latencies))
 
