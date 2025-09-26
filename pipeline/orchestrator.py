@@ -561,15 +561,10 @@ class ParallelVoiceAssistant:
             self.stats.llm_latencies.append(latency)
 
             if self.stats.recording_to_first_llm_latency is None:
-                first_voice_time: Optional[float]
-                with self._activity_lock:
-                    first_voice_time = self._first_voice_time
+                
 
-                if first_voice_time is not None:
-                    self.stats.recording_to_first_llm_latency = max(
-                        0.0, response_ready_time - first_voice_time
-                    )
-                elif self._recording_stop_time is not None:
+                
+                if  self._recording_stop_time is not None:
                     self.stats.recording_to_first_llm_latency = max(
                         0.0, response_ready_time - self._recording_stop_time
                     )
