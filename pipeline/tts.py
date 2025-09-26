@@ -372,9 +372,12 @@ class BufferedTTS:
         sel.register(stdout_fd, selectors.EVENT_READ)
         
         try:
+            any_bytes = False
             while time.time() < deadline:
                 events = sel.select(timeout=idle_s)
                 if not events:
+                    if not any_bytes:
+                        continue
                     break
                 for _key,_mask in events :
                     data = os.read(stdout_fd, 8192)
@@ -383,6 +386,7 @@ class BufferedTTS:
                         return payload if (len(payload) & 1) == 0 else payload[:-1]
                     
                     chunks.append(data)
+                    any_bytes = True
             payload = b"".join(chunks)
             return payload if (len(payload)&1) == 0 else payload[:-1]
         finally:
