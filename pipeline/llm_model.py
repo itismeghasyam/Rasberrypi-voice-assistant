@@ -222,7 +222,9 @@ class StreamingLLM:
 
     def _should_respond(self) -> bool:
         current = " ".join(self.context_buffer)
-        return any(marker in current for marker in [".", "?", "!"])
+        if any(marker in current for marker in [".", "?", "!"]):
+            return True
+        return len(current.split()) >=6
 
     def _generate_response(self, text: str) -> str:
         prompt = f"Answer concisely: {text}".strip()
