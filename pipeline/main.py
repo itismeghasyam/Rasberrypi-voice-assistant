@@ -31,7 +31,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--whisper-threads",
         type=int,
-        default=os.cpu_count() or 2,
+        default=os.cpu_count() or 1,
         help="Threads to dedicate to whisper.cpp",
     )
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="Threads to pass to llama110")
