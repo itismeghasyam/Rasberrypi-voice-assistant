@@ -644,7 +644,7 @@ class ParallelVoiceAssistant:
         and getattr(self.stats, "recording_start_time", None) is not None
         ):
             self.stats.recording_start_to_first_tts_latency = max(
-                0.0, started_at - self.stats.recording_start_time
+                0.0, started_at - self.stats.recording_stop_time
             )
 
         if (
@@ -738,7 +738,7 @@ class ParallelVoiceAssistant:
                 f"{self.stats.recording_to_first_llm_latency:.2f}s"
             )
         else:
-            print("Recording -> first LLM response: n/a")
+            print("Recording stop -> first LLM response: n/a")
 
         if self.stats.recording_stop_to_first_tts_latency is not None:
             print(
