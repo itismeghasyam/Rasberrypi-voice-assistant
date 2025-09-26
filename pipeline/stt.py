@@ -222,7 +222,7 @@ class ParallelSTTHTTP:
 
     def _post_audio(self, wav_bytes: bytes, timeout: float = 8.0) -> str:
         # Typical server accepts multipart with field name 'audio'
-        files = {"file": ("chunk.wav", wav_bytes, "audio/wav")}   # <— changed key to "file"
+        files = {"audio": ("chunk.wav", wav_bytes, "audio/wav")}   # <— changed key to "file"
         data = {"response_format": "json"}  
         try:
             r = requests.post(f"{self.server_url}/inference",
