@@ -124,7 +124,7 @@ class ParallelVoiceAssistant:
         self._stop_requested = False
         self._stop_reason: Optional[str] = None
         self._consecutive_silent_chunks = 0
-        self._silent_chunks_before_stop = max(3,int(math.ceil(self._silence_timeout/max(0.1,self._chunk_duration))))
+        self._silent_chunks_before_stop = max(2,int(math.ceil(self._silence_timeout/max(0.1,self._chunk_duration))))
         
         self._noise_blacklist = {
             "wind blowing",
@@ -148,7 +148,7 @@ class ParallelVoiceAssistant:
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
         self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(2.0 / max(0.1, self._chunk_duration))))
-        self._awaiting_transcript_timeout = max(1.0, self._chunk_duration * 1.5)
+        self._awaiting_transcript_timeout = max(0.5, self._chunk_duration * 1.5)
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
         self._active_flush_ids: Set[int] = set()
@@ -336,7 +336,7 @@ class ParallelVoiceAssistant:
 
             self.stats.recording_stop_time = self._recording_stop_time
 
-        stt_thread.join(timeout=5.0)
+        stt_thread.join(timeout=2.0)
 
         # Decide whether to run a final STT pass
         finalize_future = None

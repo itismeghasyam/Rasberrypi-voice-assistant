@@ -20,7 +20,7 @@ class ParallelSTT:
 
     def __init__(
         self,
-        num_workers: int = 1,
+        num_workers: int = 2,
 
         sample_rate: int = SAMPLE_RATE,
         whisper_exe: Path = WHISPER_EXE,

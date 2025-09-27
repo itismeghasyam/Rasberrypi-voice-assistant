@@ -13,7 +13,7 @@ from orchestrator import ParallelVoiceAssistant
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming voice assistant pipeline")
 
-    parser.add_argument("--duration", type=float, default=30.0, help="How long to run the streaming demo")
+    parser.add_argument("--duration", type=float, default=15.0, help="How long to run the streaming demo")
     parser.add_argument("--warmup", action="store_true", help="Run model warm-up steps before streaming")
     parser.add_argument("--piper-model", type=Path, default=PIPER_MODEL_PATH, help="Path to Piper .onnx model")
     parser.add_argument(
