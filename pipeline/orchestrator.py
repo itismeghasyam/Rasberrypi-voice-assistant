@@ -52,7 +52,7 @@ class ParallelVoiceAssistant:
         self,
         chunk_duration: float = CHUNK_DURATION,
         sample_rate: int = SAMPLE_RATE,
-        stt_workers: int = 1,
+        stt_workers: int = 2,
 
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
