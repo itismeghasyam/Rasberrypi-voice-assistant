@@ -415,11 +415,7 @@ class ParallelVoiceAssistant:
                 # empty/noise transcriptions as silent and call _handle_silent_audio_chunk()).
                 if not is_silent:
                     self._register_activity()
-                future = (
-                    self.stt.empty_future(chunk_id)
-                    if is_silent
-                    else self.stt.submit_chunk(audio_chunk, chunk_id)
-                )
+                future = (self.stt.submit_chunk(audio_chunk, chunk_id))
                 self.stt_futures.put((chunk_id, future, time.time()))
                 self.stats.stt_chunks += 1
                 chunk_id += 1
