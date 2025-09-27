@@ -198,7 +198,7 @@ class ParallelSTTHTTP:
         self._emitted_transcript = ""
         self._last_partial = ""
         self._rolling: bytearray = bytearray()
-        self._rolling_ms = 1200  # keep ~1.2 s of audio
+        self._rolling_ms = 600  # keep ~1.2 s of audio
         self._last_http_fail = 0.0
 
 
@@ -222,12 +222,14 @@ class ParallelSTTHTTP:
 
     def _post_audio(self, wav_bytes: bytes, timeout: float = 8.0) -> str:
         # Typical server accepts multipart with field name 'audio'
-        files = {"audio": ("chunk.wav", wav_bytes, "audio/wav")}   # <— changed key to "file"
-        data = {"response_format": "json"}  
+        files = {"file": ("chunk.wav", wav_bytes, "audio/wav")}   # <— changed key to "file"
+        data = {"response_format": "json",
+                "temparature":"0.2",
+                "audio_format":"wav"}  
         try:
             r = requests.post(f"{self.server_url}/inference",
                   files=files,
-                  data={"response_format": "json"},   # <-- add this
+                  data=data,   # <-- add this
                   timeout=timeout)
 
             r.raise_for_status()
@@ -258,12 +260,12 @@ class ParallelSTTHTTP:
             rolling = rolling + b"\x00" * (min_bytes - len(rolling))
 
         wav = self._wav_bytes(rolling)
-        text = (self._post_audio(wav, timeout=5.0) or "").strip()  # keep tight timeout
+        text = (self._post_audio(wav, timeout=20.0) or "").strip()  # keep tight timeout
 
         if not text:
             # optional fallback: try just the chunk once (rarely needed)
             wav_single = self._wav_bytes(audio_bytes)
-            text = (self._post_audio(wav_single, timeout=2.0) or "").strip()
+            text = (self._post_audio(wav_single, timeout=30.0) or "").strip()
 
         return {"chunk_id": chunk_id, "text": text, "is_final": False}
 
@@ -280,7 +282,7 @@ class ParallelSTTHTTP:
             return {"chunk_id": chunk_id, "text": "", "is_final": True}
 
         wav = self._wav_bytes(b"".join(chunks))
-        full_text = (self._post_audio(wav, timeout=6.0) or "").strip()
+        full_text = (self._post_audio(wav, timeout=30.0) or "").strip()
 
         new_text = full_text
         if emitted and full_text.lower().startswith(emitted.lower()):
