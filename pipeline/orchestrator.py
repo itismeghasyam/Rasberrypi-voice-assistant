@@ -52,7 +52,7 @@ class ParallelVoiceAssistant:
         self,
         chunk_duration: float = CHUNK_DURATION,
         sample_rate: int = SAMPLE_RATE,
-        stt_workers: int = 2,
+        stt_workers: int = 1,
 
         whisper_exe: Path = WHISPER_EXE,
         whisper_model: Path = WHISPER_MODEL,
@@ -147,8 +147,8 @@ class ParallelVoiceAssistant:
         self._chunk_activity: Dict[int, bool] = {}
         self._awaiting_transcript_chunks = 0
         self._awaiting_transcript_started_at: Optional[float] = None
-        self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(2.0 / max(0.1, self._chunk_duration))))
-        self._awaiting_transcript_timeout = max(0.5, self._chunk_duration * 1.5)
+        self._awaiting_transcript_chunk_limit = max(2, int(math.ceil(1.0 / max(0.1, self._chunk_duration))))
+        self._awaiting_transcript_timeout = max(0.5, self._chunk_duration * 1.0)
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
         self._active_flush_ids: Set[int] = set()

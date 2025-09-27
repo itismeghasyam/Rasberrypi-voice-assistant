@@ -3,7 +3,7 @@ import shutil, threading, numpy as np
 import tempfile,subprocess,wave, contextlib
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
-import io, json, requests,time
+import io, json, requests,time,os
 
 
 from config import SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL
@@ -39,7 +39,12 @@ class ParallelSTT:
         self._transcript_lock = threading.Lock()
         self._emitted_transcript = ""
         self._last_partial = ""
-        self._temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_stt_"))
+        
+        ramdir = "/dev/shm"
+        mkdtemp_kwargs = {"prefix":"pipeline_stt_"}
+        if os.path.isdir(ramdir):
+            mkdtemp_kwargs["dir"] = ramdir
+        self._temp_dir = Path(tempfile.mkdtemp(**mkdtemp_kwargs))
 
         if not self.whisper_exe.exists():
             raise FileNotFoundError(f"Whisper binary not found: {self.whisper_exe}")
@@ -198,7 +203,7 @@ class ParallelSTTHTTP:
         self._emitted_transcript = ""
         self._last_partial = ""
         self._rolling: bytearray = bytearray()
-        self._rolling_ms = 600  # keep ~1.2 s of audio
+        self._rolling_ms = 600 
         self._last_http_fail = 0.0
 
 
