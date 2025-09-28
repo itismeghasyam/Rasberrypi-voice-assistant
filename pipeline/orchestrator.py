@@ -152,6 +152,9 @@ class ParallelVoiceAssistant:
         self._stt_flush_in_progress = False
         self._next_finalize_id = 1_000_000
         self._active_flush_ids: Set[int] = set()
+        
+        self._flushed_since_last_speech = False
+
 
 
 
@@ -394,7 +397,7 @@ class ParallelVoiceAssistant:
                     self._register_activity()
                     future = (self.stt.submit_chunk(audio_chunk, chunk_id))
                 else:
-                    future - self.stt.empty_future(chunk_id)
+                    future = self.stt.empty_future(chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
                 self.stats.stt_chunks += 1
                 chunk_id += 1
@@ -432,6 +435,7 @@ class ParallelVoiceAssistant:
                 self._active_flush_ids.discard(chunk_id)
                 self._active_flush_ids.discard(res_chunk_id)
                 self._stt_flush_in_progress = False
+                self._flushed_since_last_speech = True
 
 
             latency = max(0.0, time.time() - start_time)
@@ -482,8 +486,9 @@ class ParallelVoiceAssistant:
                         )
 
                     continue
-                if self._has_detected_speech and not self._stt_flush_in_progress:
+                if self._has_detected_speech and not self._stt_flush_in_progress and not self._flushed_since_last_speech:
                     self._queue_intermediate_transcription("[STT] Silence boundary -> flushing buffered speech")
+                    self._flushed_since_last_speech = True
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
                 self._reset_awaiting_transcript_state()
@@ -496,6 +501,7 @@ class ParallelVoiceAssistant:
             self._reset_awaiting_transcript_state()
             self._register_activity()
             self._consecutive_silent_chunks = 0
+            self._flushed_since_last_speech = False
 
             print(f"[STT] Chunk {res_chunk_id}: {text}")
 
