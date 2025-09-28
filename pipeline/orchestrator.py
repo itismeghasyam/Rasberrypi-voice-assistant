@@ -392,7 +392,9 @@ class ParallelVoiceAssistant:
                
                 if not is_silent:
                     self._register_activity()
-                future = (self.stt.submit_chunk(audio_chunk, chunk_id))
+                    future = (self.stt.submit_chunk(audio_chunk, chunk_id))
+                else:
+                    future - self.stt.empty_future(chunk_id)
                 self.stt_futures.put((chunk_id, future, time.time()))
                 self.stats.stt_chunks += 1
                 chunk_id += 1
@@ -480,7 +482,8 @@ class ParallelVoiceAssistant:
                         )
 
                     continue
-
+                if self._has_detected_speech and not self._stt_flush_in_progress:
+                    self._queue_intermediate_transcription("[STT] Silence boundary -> flushing buffered speech")
                 # Treat as silent/noise: increment silent-chunk logic and DO NOT feed to LLM
                 print(f"[STT] Chunk {res_chunk_id}: {text} (treated as noise/empty)")
                 self._reset_awaiting_transcript_state()
