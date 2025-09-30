@@ -11,7 +11,7 @@ from config import CHUNK_DURATION, SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPE
 from recorder import StreamingRecorder
 from stt import ParallelSTT
 from tts import BufferedTTS
-from llm_model import StreamingLLM
+from llm_model import StreamingLLM, speak_text_timed
 
 
 
@@ -73,6 +73,7 @@ class ParallelVoiceAssistant:
     ) -> None:
         self._chunk_duration = float(chunk_duration)
         self.recorder = StreamingRecorder(chunk_duration=chunk_duration, sample_rate=sample_rate)
+        
         if whisper_server:
             # HTTP (persistent) STT
             from stt import ParallelSTTHTTP
@@ -92,8 +93,8 @@ class ParallelVoiceAssistant:
                 emit_partials=emit_stt_partials,
             )
         self.llm = StreamingLLM(llama_kwargs=llama_kwargs)
-
-        self.tts = BufferedTTS(
+        
+        """self.tts = BufferedTTS(
             model_path=piper_model_path,
             playback_cmd=playback_cmd,
             output_device=output_device,
@@ -102,8 +103,8 @@ class ParallelVoiceAssistant:
 
             on_playback_start=self._on_tts_playback_start,
             on_playback_error=self._on_tts_playback_error,
-        )
-
+        )"""
+        self.tts = None
         self.stt_futures: "queue.Queue[Tuple[int, Future, float]]" = queue.Queue()
         self.llm_futures: "queue.Queue[Tuple[Future, float, float]]" = queue.Queue()
         self.stats = PipelineStats()
@@ -154,6 +155,7 @@ class ParallelVoiceAssistant:
         self._active_flush_ids: Set[int] = set()
         
         self._flushed_since_last_speech = False
+        self.espeak_tts = lambda text, segment_id: speak_text_timed(text)
 
 
 
@@ -287,7 +289,7 @@ class ParallelVoiceAssistant:
 
 
         self.recorder.start()
-        self.tts.start_playback()
+    
 
         stt_thread = threading.Thread(target=self._stt_pipeline, name="STTPipeline", daemon=True)
         llm_thread = threading.Thread(target=self._llm_pipeline, name="LLMPipeline", daemon=True)
@@ -343,8 +345,8 @@ class ParallelVoiceAssistant:
 
         # Decide whether to run a final STT pass
         finalize_future = None
+        recent_voice = False
         if self.stats.stt_chunks > 0:
-            recent_voice = False
             with self._activity_lock:
                 if self._last_voice_time:
                     recent_voice = (time.time() - self._last_voice_time) < 1.0
@@ -365,7 +367,7 @@ class ParallelVoiceAssistant:
         self.stt.shutdown()
         self.llm.shutdown()
         self._wait_for_tts_completion()
-        self.tts.stop()
+
 
         elapsed = time.time() - start_time
         self._print_stats(elapsed)
@@ -567,21 +569,17 @@ class ParallelVoiceAssistant:
             sentences = self._split_sentences(response)
             if not sentences:
                 sentences = [response]
-
+            """
             tts_jobs: List[Tuple[Future, float]] = []
             for sentence in sentences:
                 submit_time = time.time()
-                future = self.tts.generate_and_queue(sentence, segment_id)
-                if future is not None:
-                    self.stats.tts_segments += 1
-                    with self._tts_futures_lock:
-                        self._pending_tts_futures.add(future)
-                    tts_jobs.append((future, submit_time))
-                segment_id += 1
-
-            if not tts_jobs:
-                continue
-
+                self.espeak_tts(sentence, segment_id)
+                self.stats.tts_segments += 1
+                try:
+                    if getattr(self, "recorder", None) and getattr(self.recorder, "recording", False):
+                        self._request_stop("[MAIN] Stopping recorder during TTS to avoid feedback.")
+                except Exception:
+                    pass
 
             pending_timestamp = self._reference_timestamp_for_output(reference_timestamp)
             pending = PendingOutput(timestamp=pending_timestamp, segments_expected=len(tts_jobs))
@@ -593,6 +591,38 @@ class ParallelVoiceAssistant:
                 future.add_done_callback(
                     lambda fut, start=submit_time, pending_ref=pending: self._on_tts_generated(fut, start, pending_ref)
                 )
+            """
+            
+            for sentence in sentences:
+                # mark "audio start" for latency metrics
+                started_at = time.time()
+
+                # First-TTS metrics
+                if (self.stats.recording_start_to_first_tts_latency is None 
+                        and getattr(self.stats, "recording_start_time", None) is not None):
+                    self.stats.recording_start_to_first_tts_latency = max(
+                        0.0, started_at - self.stats.recording_start_time
+                    )
+                if self.stats.recording_stop_to_first_tts_latency is None and self._recording_stop_time is not None:
+                    self.stats.recording_stop_to_first_tts_latency = max(
+                        0.0, started_at - self._recording_stop_time
+                    )
+
+                # input -> output gap (reference to playback start)
+                self.stats.input_to_output_latencies.append(max(0.0, started_at - reference_timestamp))
+
+                # Speak (sync, fast) and bump stats
+                self.espeak_tts(sentence, segment_id)
+                self.stats.tts_segments += 1
+
+                # Avoid feedback: stop recorder if still running
+                try:
+                    if getattr(self, "recorder", None) and getattr(self.recorder, "recording", False):
+                        self._request_stop("[MAIN] Stopping recorder during TTS to avoid feedback.")
+                except Exception:
+                    pass
+
+                segment_id += 1
 
     def _on_tts_generated(self, future: Future, start_time: float, pending: PendingOutput) -> None:
         try:
@@ -738,7 +768,7 @@ class ParallelVoiceAssistant:
         print("----------------------\n")
 
     def _wait_for_tts_completion(self, timeout: float = 15.0) -> None:
-        if self.stats.tts_segments == 0:
+        if self.stats.tts_segments == 0 or self.tts is None :
             return
 
         deadline = time.time() + max(0.0, timeout)
