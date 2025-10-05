@@ -195,8 +195,11 @@ class StreamingLLM:
         self.llama_kwargs.setdefault("n_predict", 12)
         self.llama_kwargs.setdefault("threads", os.cpu_count() or 4)
         self.llama_kwargs.setdefault("temperature", 0.6)
+        self._closed = False
 
     def process_incremental(self, text_chunk: str, is_final: bool = False) -> Optional[Future]:
+        if getattr(self, "_closed", False):
+            return None
         chunk = (text_chunk or "").strip()
         if chunk:
             self.context_buffer.append(chunk)
@@ -275,5 +278,6 @@ class StreamingLLM:
 
 
     def shutdown(self) -> None:
+        self._closed = True
         self.executor.shutdown(wait=False)
 

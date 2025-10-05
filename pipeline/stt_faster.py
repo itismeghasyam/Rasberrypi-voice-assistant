@@ -31,10 +31,10 @@ class PersistentWhisperSTT:
         whisper_threads: Optional[int] = None,
         emit_partials: bool = True,
         # faster-whisper specific
-        model_name: str = "tiny",      # try "tiny" or "tiny.en"
-        compute_type: str = "int8",    # good for Pi 4
-        rolling_ms: int = 1200,        # short tail for quick partials
-        language: Optional[str] = None # e.g., "en" to force English
+        model_name: str = "tiny.en",     
+        compute_type: str = "int8",    
+        rolling_ms: int = 1200,        
+        language: Optional[str] = None 
     ) -> None:
         if WhisperModel is None:
             raise RuntimeError(f"faster-whisper is not installed: {_import_err}")
@@ -55,7 +55,7 @@ class PersistentWhisperSTT:
         self._emitted_transcript = ""
         self._last_partial = ""
 
-    # -------- helpers --------
+    
     def empty_future(self, chunk_id: int) -> Future:
         return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
 
@@ -75,7 +75,7 @@ class PersistentWhisperSTT:
         )
         return "".join(seg.text for seg in segments).strip()
 
-    # -------- workers --------
+    
     def _process_chunk_fw(self, audio_bytes: bytes, chunk_id: int) -> Dict[str, Any]:
         with self._transcript_lock:
             rolling = bytes(self._rolling)
@@ -120,9 +120,9 @@ class PersistentWhisperSTT:
 
         return {"chunk_id": chunk_id, "text": new_text, "is_final": mark_final}
 
-    # -------- public API --------
+    # public API
     def submit_chunk(self, audio_chunk: np.ndarray, chunk_id: int) -> Future:
-        # `audio_chunk` is np.int16 from your recorder
+        
         audio_bytes = np.ascontiguousarray(audio_chunk, dtype=np.int16).tobytes()
         with self._transcript_lock:
             self._chunks.append(audio_bytes)
