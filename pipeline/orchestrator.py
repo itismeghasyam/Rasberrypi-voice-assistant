@@ -9,7 +9,10 @@ import os, threading, queue, re, math, psutil, numpy as np
 
 from config import CHUNK_DURATION, SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPER_MODEL_PATH, DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_TIMEOUT
 from recorder import StreamingRecorder
-from stt import ParallelSTT
+try:
+    from stt_faster import PersistentWhisperSTT as ParallelSTT
+except Exception:
+    from stt import ParallelSTT
 from tts import BufferedTTS
 from llm_model import StreamingLLM, speak_text_timed
 
