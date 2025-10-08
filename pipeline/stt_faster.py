@@ -15,6 +15,11 @@ except Exception as e:
 
 from config import SAMPLE_RATE
 
+
+_SHARED_MODEL = None
+_SHARED_LOCK = threading.Lock()
+
+
 class PersistentWhisperSTT:
     """
     Public API matches your existing STT classes:
@@ -50,9 +55,19 @@ class PersistentWhisperSTT:
         self.language = language
         self.use_vad = use_vad
 
-        # Load once, keep hot
-        self.model = WhisperModel(model_name, device="cpu", compute_type=compute_type)
-        print(f"[STT][FW] Loaded {model_name} ({compute_type}) — hot")
+        # Load once
+        def _get_shared_model(model_name: str, compute_type: str):
+            global _SHARED_MODEL
+            if _SHARED_MODEL is None:
+                with _SHARED_LOCK:
+                    if _SHARED_MODEL is None:
+                        _SHARED_MODEL = WhisperModel(model_name, device="cpu", compute_type=compute_type)
+                        print(f"[STT][FW] Loaded shared model {model_name} ({compute_type}) — hot")
+            else:
+                print(f"[STT][FW] Reusing shared model {model_name} ({compute_type}) — hot")
+            return _SHARED_MODEL
+        self.model = _get_shared_model(model_name, compute_type)
+
 
         # Rolling buffers + state
         self._window_bytes = int(self.sample_rate * 2 * (window_ms / 1000.0))
@@ -67,6 +82,19 @@ class PersistentWhisperSTT:
         self._last_emitted_text = ""
 
     # ---------- helpers ----------
+    
+    def _get_shared_model(model_name: str, compute_type: str):
+        global _SHARED_MODEL
+        if _SHARED_MODEL is None:
+            with _SHARED_LOCK:
+                if _SHARED_MODEL is None:
+                    _SHARED_MODEL = WhisperModel(model_name, device="cpu", compute_type=compute_type)
+                    print(f"[STT][FW] Loaded shared model {model_name} ({compute_type}) — hot")
+        else:
+            print(f"[STT][FW] Reusing shared model {model_name} ({compute_type}) — hot")
+        return _SHARED_MODEL
+    
+    
     def empty_future(self, chunk_id: int) -> Future:
         return self.executor.submit(lambda cid=chunk_id: {"chunk_id": cid, "text": "", "is_final": False})
 

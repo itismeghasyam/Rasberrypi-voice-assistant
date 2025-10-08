@@ -129,4 +129,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        main()
+        try:
+            again = input("Run another session? [y/N]: ").strip().lower()
+        except EOFError:
+            break
+        if again != "y":
+            break
