@@ -129,17 +129,15 @@ def main() -> None:
     assistant.run(duration=max_duration)
 
 
-
-if __name__ == "__main__":
-    try:
-        print("Press the button to start the assistant.")
-        while True:
-            GPIO.wait_for_edge(BUTTON_PIN, GPIO.FALLING)  # waits for button press
+try:
+    print("Press the button to start the assistant.")
+    while True:
+        if GPIO.input(BUTTON_PIN) == GPIO.LOW:
             print("Button pressed — running session.")
             main()
-            print("Session ended. Press button again to start.")
-            time.sleep(1.0)  # debounce
-    except KeyboardInterrupt:
-        print("Exiting.")
-    finally:
-        GPIO.cleanup()
+            print("Session ended. Waiting for next press.")
+            while GPIO.input(BUTTON_PIN) == GPIO.LOW:  # wait for release
+                time.sleep(0.1)
+        time.sleep(0.05)
+except KeyboardInterrupt:
+    GPIO.cleanup()
