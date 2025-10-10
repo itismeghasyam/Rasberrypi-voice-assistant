@@ -1,13 +1,15 @@
 
 from pathlib import Path
-import os, argparse
+import os, argparse, RPi.GPIO as GPIO,time
 
 from config import CHUNK_DURATION, SAMPLE_RATE, WHISPER_EXE, WHISPER_MODEL, PIPER_MODEL_PATH, DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_TIMEOUT
 from warmup import ModelPreloader
 from orchestrator import ParallelVoiceAssistant
 
 
-
+BUTTON_PIN = 17  
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -129,11 +131,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    while True:
-        main()
-        try:
-            again = input("Run another session? [y/N]: ").strip().lower()
-        except EOFError:
-            break
-        if again != "y":
-            break
+    try:
+        print("Press the button to start the assistant.")
+        while True:
+            GPIO.wait_for_edge(BUTTON_PIN, GPIO.FALLING)  # waits for button press
+            print("Button pressed — running session.")
+            main()
+            print("Session ended. Press button again to start.")
+            time.sleep(1.0)  # debounce
+    except KeyboardInterrupt:
+        print("Exiting.")
+    finally:
+        GPIO.cleanup()
