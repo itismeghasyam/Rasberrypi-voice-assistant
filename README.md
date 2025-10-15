@@ -128,8 +128,8 @@ Ballpark on Raspberry Pi 4 8 GB:
 # Documentation
 
 ### Core Modules
-- [Main entrypoint (`main.py`)](documentation/main.md)
-- [Pipeline Orchestrator (`orchestrator.py`)](documentation/orchestrator.md)
-- [Recorder (`recorder.py`)](documentation/recorder.md)
-- [Faster-Whisper STT (`stt_faster.py`)](documentation/stt_faster.md)
-- [Configuration (`config.py`)](documentation/config.md)
+- [Main entrypoint (`main.py`)](Documentation/main.md)
+- [Pipeline Orchestrator (`orchestrator.py`)](Documentation/orchestrator.md)
+- [Recorder (`recorder.py`)](Documentation/recorder.md)
+- [Faster-Whisper STT (`stt_faster.py`)](Documentation/stt_faster.md)
+- [Configuration (`config.py`)](Documentation/config.md)
