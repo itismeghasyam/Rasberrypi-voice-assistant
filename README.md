@@ -4,7 +4,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%204%20%288GB%29-red.svg)
 ![STT](https://img.shields.io/badge/STT-Faster--Whisper-brightgreen.svg)
 ![TTS](https://img.shields.io/badge/TTS-eSpeak-lightgrey.svg)
-![LLM](https://img.shields.io/badge/LLM-llama.cpp-black.svg)
+![LLM](https://img.shields.io/badge/LLM-Llama 2 C Stories 110M pruned50 Q3_K_M (GGUF)-purple.svg)
 ![Status](https://img.shields.io/badge/Status-Working-success.svg)
 
 Local voice assistant for Raspberry Pi 4 (8 GB).  
@@ -20,8 +20,6 @@ It records from a mic, transcribes with Faster-Whisper, generates a short reply 
 - [Models](#models)
 - [Repository layout](#repository-layout)
 - [Performance notes](#performance-notes)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
 
 ---
 
@@ -40,7 +38,6 @@ It records from a mic, transcribes with Faster-Whisper, generates a short reply 
 - **Mic and speakers** any ALSA visible devices
 - **Button wiring** connect a momentary push button between **GPIO 17** and **GND (pin 6)**
 
-Place this file in your repo at `assets/Pinout1-275x300.png` so the diagram renders:
 
 ![Raspberry Pi 4B pinout](assets/Pinout1-275x300.png)
 
@@ -124,9 +121,7 @@ Ballpark on Raspberry Pi 4 8 GB:
 | Whisper CLI      | ~10         | Too slow on CPU                 |
 | Faster-Whisper   | ~5          | Shared int8 model kept warm     |
 | eSpeak           | <0.2        | Near instant                    |
-| End to end       | ~5–6        | Short prompt round trip         |
+| End to end       | ~5          | Short prompt round trip         |
 
 ---
 
-## License
-MIT recommended. Add a `LICENSE` file and update the badge at the top.
