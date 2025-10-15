@@ -4,7 +4,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%204%20%288GB%29-red.svg)
 ![STT](https://img.shields.io/badge/STT-Faster--Whisper-brightgreen.svg)
 ![TTS](https://img.shields.io/badge/TTS-eSpeak-lightgrey.svg)
-![LLM](https://img.shields.io/badge/LLM-Llama 2 C Stories 110M pruned50 Q3_K_M (GGUF)-purple.svg)
+![LLM](https://img.shields.io/badge/LLM-Llama2CStories110M-purple.svg)
 ![Status](https://img.shields.io/badge/Status-Working-success.svg)
 
 Local voice assistant for Raspberry Pi 4 (8 GB).  
